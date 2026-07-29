@@ -1,6 +1,18 @@
-# EarthSentry — Environmental Change Detection System
+<div align="center">
+  <img src="frontend/src/assets/repo_img.png" alt="GeoWatch Nexus Dashboard" width="100%" style="border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.15);" />
 
-EarthSentry is a high-performance web application designed for satellite-based environmental monitoring. It allows researchers and analysts to define Areas of Interest (AOIs) anywhere on Earth, fetching satellite data to perform advanced change detection.
+  # GeoWatch Nexus
+  **A Satellite-Based Environmental Change Detection and Alert System**
+
+  [![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)](https://reactjs.org/)
+  [![Vite](https://img.shields.io/badge/Vite-B73BFE?style=for-the-badge&logo=vite&logoColor=FFD62E)](https://vitejs.dev/)
+  [![Flask](https://img.shields.io/badge/Flask-000000?style=for-the-badge&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
+  [![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+</div>
+
+<br />
+
+GeoWatch Nexus is a high-performance web application designed for satellite-based environmental monitoring. It allows researchers and analysts to define Areas of Interest (AOIs) anywhere on Earth, fetching satellite data to perform advanced change detection.
 
 This repository contains both the **Flask Backend** (API) and the **Vite + React Frontend** (UI).
 
@@ -73,7 +85,7 @@ The project is structured as a monorepo containing two main directories:
 
 ## 🎨 UI/UX Design System
 
-EarthSentry utilizes a highly customized vanilla CSS design system (`index.css`) rather than a heavy utility framework like Tailwind. This allows for precise micro-interactions and high-performance CSS animations:
+GeoWatch Nexus utilizes a highly customized vanilla CSS design system (`index.css`) rather than a heavy utility framework like Tailwind. This allows for precise micro-interactions and high-performance CSS animations:
 
 * **Glassmorphism Panels**: Semi-transparent frosted glass effects over the map.
 * **Celestial Toggle**: A custom sun/moon toggle switch featuring internal craters, rays, and mini-stars.
@@ -85,4 +97,6 @@ EarthSentry utilizes a highly customized vanilla CSS design system (`index.css`)
 * The `requirements.txt` is up-to-date and tracks all necessary backend packages (`flask`, `flask-cors`, `python-dotenv`).
 
 ---
-*Built with ❤️ for Environmental Monitoring.*
+<div align="center">
+  <em>Built with ❤️ for Environmental Monitoring.</em>
+</div>
