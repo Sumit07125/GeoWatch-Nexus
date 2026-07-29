@@ -1,0 +1,15 @@
+# Ignore common monorepo root files
+.DS_Store
+.idea/
+.vscode/
+
+# Ignore backend and frontend specific files at the root just in case
+node_modules/
+__pycache__/
+venv/
+.venv/
+env/
+.env
+*.zip
+
+# Note: The /frontend and /backend directories have their own specific .gitignore files.
