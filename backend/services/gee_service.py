@@ -42,26 +42,13 @@ def get_aoi_images(coordinates):
     # Sentinel-2 Surface Reflectance
     s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     
-    now = datetime.now()
-    current_start = (now - relativedelta(months=6)).strftime('%Y-%m-%d')
-    current_end = now.strftime('%Y-%m-%d')
-    
-    hist_start = (now - relativedelta(years=6)).strftime('%Y-%m-%d')
-    hist_end = (now - relativedelta(years=5)).strftime('%Y-%m-%d')
-    
-    # 1. Current Image (Past 6 months)
-    current_img = s2.filterBounds(roi) \
-                    .filterDate(current_start, current_end) \
-                    .sort('CLOUDY_PIXEL_PERCENTAGE') \
-                    .first() \
-                    .clip(roi)
+    # 1. Current Image (Most recent 20 images, pick least cloudy)
+    current_col = s2.filterBounds(roi).sort('system:time_start', False).limit(20)
+    current_img = current_col.sort('CLOUDY_PIXEL_PERCENTAGE').first().clip(roi)
                     
-    # 2. Historical Image (5 to 6 years ago)
-    historical_img = s2.filterBounds(roi) \
-                       .filterDate(hist_start, hist_end) \
-                       .sort('CLOUDY_PIXEL_PERCENTAGE') \
-                       .first() \
-                       .clip(roi)
+    # 2. Historical Image (Oldest 20 images, pick least cloudy)
+    historical_col = s2.filterBounds(roi).sort('system:time_start', True).limit(20)
+    historical_img = historical_col.sort('CLOUDY_PIXEL_PERCENTAGE').first().clip(roi)
                        
     # Visualization params for True Color RGB
     vis_params = {
@@ -99,14 +86,11 @@ def download_tensors_for_ml(coordinates):
     
     s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
     
-    now = datetime.now()
-    current_start = (now - relativedelta(months=6)).strftime('%Y-%m-%d')
-    current_end = now.strftime('%Y-%m-%d')
-    hist_start = (now - relativedelta(years=6)).strftime('%Y-%m-%d')
-    hist_end = (now - relativedelta(years=5)).strftime('%Y-%m-%d')
+    current_col = s2.filterBounds(roi).sort('system:time_start', False).limit(20)
+    current_img = current_col.sort('CLOUDY_PIXEL_PERCENTAGE').first().clip(roi)
     
-    current_img = s2.filterBounds(roi).filterDate(current_start, current_end).sort('CLOUDY_PIXEL_PERCENTAGE').first().clip(roi)
-    historical_img = s2.filterBounds(roi).filterDate(hist_start, hist_end).sort('CLOUDY_PIXEL_PERCENTAGE').first().clip(roi)
+    historical_col = s2.filterBounds(roi).sort('system:time_start', True).limit(20)
+    historical_img = historical_col.sort('CLOUDY_PIXEL_PERCENTAGE').first().clip(roi)
     
     bands = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B10', 'B11', 'B12']
     current_img = current_img.select(bands)
