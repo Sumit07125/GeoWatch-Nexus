@@ -13,3 +13,5 @@ env/
 *.zip
 
 # Note: The /frontend and /backend directories have their own specific .gitignore files.
+backend/ml_models/best_model.pt
+backend/static/

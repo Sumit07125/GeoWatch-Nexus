@@ -7,10 +7,12 @@
 
 import React, { useMemo } from "react";
 import { useTheme } from "../context/ThemeContext";
+import { useNavigate, useLocation } from "react-router-dom";
 
 const NAV_ITEMS = [
   {
     id: "dashboard",
+    path: "/aoi",
     label: "Dashboard",
     icon: (
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -20,10 +22,10 @@ const NAV_ITEMS = [
         <rect x="14" y="14" width="7" height="7" rx="1" />
       </svg>
     ),
-    active: true,
   },
   {
     id: "projects",
+    path: "/projects",
     label: "My Projects",
     icon: (
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -92,12 +94,14 @@ function generateStars(count) {
 
 const STARS = generateStars(25);
 
-export default function Sidebar() {
+export default function Sidebar({ collapsed, onToggle }) {
   const { theme } = useTheme();
   const isDark = theme === "dark";
+  const navigate = useNavigate();
+  const location = useLocation();
 
   return (
-    <nav className="sidebar" aria-label="Main navigation">
+    <nav className={`sidebar ${collapsed ? 'sidebar--collapsed' : ''}`} aria-label="Main navigation">
       {/* ── Light Mode: Fluffy Clouds ── */}
       <div className={`sidebar__clouds ${isDark ? 'sidebar__clouds--hidden' : ''}`}>
         <div className="fluffy-cloud fluffy-cloud--top"></div>
@@ -130,28 +134,35 @@ export default function Sidebar() {
 
       {/* Logo + Brand */}
       <div className="sidebar__brand">
-        <div className="sidebar__logo-icon">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="10" />
-            <path d="M2 12h20" />
-            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-          </svg>
+        <div className="sidebar__brand-left" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div className="sidebar__logo-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M13 7 9 3 5 7l4 4" />
+              <path d="m17 11 4 4-4 4-4-4" />
+              <path d="m8 12 4 4 6-6-4-4Z" />
+              <path d="m16 8 3-3" />
+              <path d="M9 21a6 6 0 0 0-6-6" />
+            </svg>
+          </div>
+          <span className="sidebar__brand-name">GeoWatch-Nexus</span>
         </div>
-        <span className="sidebar__brand-name">EarthSentry</span>
       </div>
 
       {/* Nav Items */}
       <div className="sidebar__nav">
-        {NAV_ITEMS.map((item) => (
-          <button
-            key={item.id}
-            className={`sidebar__item ${item.active ? "sidebar__item--active" : ""}`}
-            onClick={(e) => e.preventDefault()}
-          >
-            <span className="sidebar__item-icon">{item.icon}</span>
-            <span className="sidebar__item-label">{item.label}</span>
-          </button>
-        ))}
+        {NAV_ITEMS.map((item) => {
+          const isActive = item.path ? location.pathname.startsWith(item.path) : false;
+          return (
+            <button
+              key={item.id}
+              className={`sidebar__item ${isActive ? "sidebar__item--active" : ""}`}
+              onClick={() => { if (item.path) navigate(item.path); }}
+            >
+              <span className="sidebar__item-icon">{item.icon}</span>
+              <span className="sidebar__item-label">{item.label}</span>
+            </button>
+          );
+        })}
       </div>
 
       {/* Bottom — Logout */}
@@ -164,7 +175,7 @@ export default function Sidebar() {
               <line x1="21" y1="12" x2="9" y2="12" />
             </svg>
           </span>
-          <span className="sidebar__item-label">Logout</span>
+          {!collapsed && <span className="sidebar__item-label">Logout</span>}
         </button>
       </div>
     </nav>

@@ -60,6 +60,7 @@ export default function AOIPage() {
   const [externalCoords, setExternalCoords] = useState(null);
   const [externalShapeType, setExternalShapeType] = useState(null);
   const [toast, setToast] = useState({ visible: false, type: "", message: "" });
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
 
   const showToast = useCallback((type, message) => {
     setToast({ visible: true, type, message });
@@ -124,14 +125,14 @@ export default function AOIPage() {
   );
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout ${isSidebarCollapsed ? 'app-layout--collapsed' : ''}`}>
       {/* Sidebar */}
-      <Sidebar />
+      <Sidebar collapsed={isSidebarCollapsed} />
 
       {/* Main Area */}
       <div className="app-layout__main">
         {/* Top Bar */}
-        <TopBar />
+        <TopBar onToggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} />
 
         {/* Welcome Banner */}
         <div className="app-layout__body">

@@ -213,13 +213,6 @@ export default function AOIPanel({
         {/* ── Manual Coordinates Tab ───────────────────────── */}
         {activeTab === "manual" && (
           <>
-            <div>
-              <div className="panel-section__title">Manual Entry</div>
-              <p className="panel-section__text">
-                Select a shape type, then enter coordinates for each vertex.
-              </p>
-            </div>
-
             {/* Shape Type Selector */}
             <div className="shape-selector">
               <div className="shape-selector__title">Shape Type</div>

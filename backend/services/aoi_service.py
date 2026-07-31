@@ -1,35 +1,16 @@
 """
 AOI Service — Business logic for Area of Interest operations.
-
-Sits between the controller and model layers. Contains validation,
-area calculation, and any future business rules.
 """
 
 import math
 from models.aoi import AOI
-
+from models.database import get_db
 
 def calculate_area_hectares(coordinates):
-    """
-    Approximate area of a polygon on Earth's surface using the Shoelace
-    formula on latitude/longitude pairs.
-
-    This uses a spherical-Earth approximation which is accurate enough
-    for the relatively small areas typical of satellite monitoring AOIs.
-
-    Args:
-        coordinates: List of [lat, lng] pairs (degrees).
-
-    Returns:
-        Area in hectares (float, rounded to 2 decimals).
-    """
     if len(coordinates) < 3:
         return 0.0
 
-    # Earth's radius in metres
     R = 6_371_000
-
-    # Convert degrees → radians and apply Shoelace on projected coordinates
     n = len(coordinates)
     area = 0.0
 
@@ -38,27 +19,13 @@ def calculate_area_hectares(coordinates):
         lng1 = math.radians(coordinates[i][1])
         lat2 = math.radians(coordinates[(i + 1) % n][0])
         lng2 = math.radians(coordinates[(i + 1) % n][1])
-
         area += (lng2 - lng1) * (2 + math.sin(lat1) + math.sin(lat2))
 
     area = abs(area) * R * R / 2.0
-
-    # Convert m² → hectares (1 ha = 10 000 m²)
     return round(area / 10_000, 2)
 
 
 def create_aoi(data):
-    """
-    Validate incoming data, compute area, persist a new AOI.
-
-    Args:
-        data (dict): Must contain 'coordinates' and 'shape_type'.
-                     May contain 'name' and 'description'.
-
-    Returns:
-        tuple: (aoi_dict, error_string | None)
-    """
-    # ── Validation ────────────────────────────────────────────────
     coordinates = data.get("coordinates")
     shape_type = data.get("shape_type")
 
@@ -74,7 +41,6 @@ def create_aoi(data):
     if shape_type == "polygon" and len(coordinates) < 3:
         return None, "polygon requires at least 3 coordinate pairs"
 
-    # ── Build & persist ───────────────────────────────────────────
     area = calculate_area_hectares(coordinates)
 
     aoi = AOI(
@@ -85,20 +51,42 @@ def create_aoi(data):
         area_hectares=area,
     )
 
-    saved = AOI.save(aoi.to_dict())
-    return saved, None
+    db = next(get_db())
+    try:
+        db.add(aoi)
+        db.commit()
+        db.refresh(aoi)
+        return aoi.to_dict(), None
+    finally:
+        db.close()
 
 
 def get_all_aois():
-    """Return every stored AOI."""
-    return AOI.get_all()
+    db = next(get_db())
+    try:
+        aois = db.query(AOI).order_by(AOI.created_at.desc()).all()
+        return [aoi.to_dict() for aoi in aois]
+    finally:
+        db.close()
 
 
 def get_aoi_by_id(aoi_id):
-    """Return a single AOI or None."""
-    return AOI.get_by_id(aoi_id)
+    db = next(get_db())
+    try:
+        aoi = db.query(AOI).filter(AOI.id == aoi_id).first()
+        return aoi.to_dict() if aoi else None
+    finally:
+        db.close()
 
 
 def delete_aoi(aoi_id):
-    """Delete an AOI. Returns True if it existed."""
-    return AOI.delete(aoi_id)
+    db = next(get_db())
+    try:
+        aoi = db.query(AOI).filter(AOI.id == aoi_id).first()
+        if not aoi:
+            return False
+        db.delete(aoi)
+        db.commit()
+        return True
+    finally:
+        db.close()

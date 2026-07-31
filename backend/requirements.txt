@@ -1,3 +1,12 @@
 flask==3.1.*
 flask-cors==5.0.*
 python-dotenv==1.1.*
+SQLAlchemy==2.0.*
+PyMySQL==1.1.*
+earthengine-api
+torch
+torchvision
+Pillow
+numpy
+tifffile
+requests

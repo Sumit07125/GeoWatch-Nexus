@@ -199,7 +199,7 @@ body {
   background-color: var(--bg-body);
   background-image: radial-gradient(var(--dot-color) 1px, transparent 1px);
   background-size: 20px 20px;
-  transition: background-color var(--t-slow), background-image var(--t-slow);
+  transition: margin-left 0.5s cubic-bezier(0.4, 0, 0.2, 1), background-color var(--t-slow), background-image var(--t-slow);
 }
 
 .app-layout__body {
@@ -226,7 +226,7 @@ body {
   flex-direction: column;
   z-index: 1100;
   overflow: hidden;
-  transition: background var(--t-slow);
+  transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1), background var(--t-slow);
 }
 
 /* Realistic Fluffy Clouds on sidebar */
@@ -351,6 +351,8 @@ body {
   font-weight: 700;
   color: #fff;
   letter-spacing: -0.3px;
+  white-space: nowrap;
+  transition: opacity 0.2s;
 }
 
 /* Nav */
@@ -1527,6 +1529,7 @@ body {
 
 .manual-entry__input {
   flex: 1;
+  min-width: 0;
   padding: 8px 10px;
   font-size: 12px;
   font-family: var(--font);
@@ -2064,6 +2067,58 @@ body {
   opacity: 0.6;
 }
 
+/* Custom Map Toolbar */
+.custom-map-toolbar {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+.custom-map-btn {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: var(--panel-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+}
+
+.custom-map-btn:hover {
+  background: var(--surface-bg);
+  color: var(--accent);
+  border-color: rgba(6, 182, 212, 0.4);
+  transform: scale(1.05);
+}
+
+.custom-map-btn--active {
+  background: rgba(6, 182, 212, 0.1);
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 15px rgba(6, 182, 212, 0.2);
+}
+
+.custom-map-btn--danger:hover {
+  color: var(--error);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.custom-map-btn:active {
+  transform: scale(0.95);
+}
+
 /* ── Map Loading Overlay ── */
 .map-view__loading-overlay {
   position: absolute;
@@ -2086,4 +2141,60 @@ body {
   flex-direction: column;
   align-items: center;
   animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* ── Collapsible Sidebar ── */
+.app-layout--collapsed {
+  --sidebar-w: 72px;
+}
+
+.sidebar__hamburger {
+  background: none;
+  border: none;
+  color: var(--sidebar-text-active);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: var(--r-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--t-fast);
+}
+
+.sidebar__hamburger:hover {
+  background: var(--sidebar-hover);
+}
+
+.sidebar--collapsed .sidebar__brand {
+  padding: 18px 17px 20px;
+}
+
+.sidebar--collapsed .sidebar__brand-name {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.1s;
+}
+
+.sidebar--collapsed .sidebar__item {
+  padding: 10px 24px;
+}
+
+.sidebar--collapsed .sidebar__item-label {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.1s;
+}
+
+.sidebar__item-label {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 0.2s var(--t-base);
+}
+
+.sidebar--collapsed .sidebar__item:hover {
+  padding-left: 24px;
+}
+
+.sidebar--collapsed .sidebar__item--active {
+  padding-left: 21px;
 }

@@ -8,7 +8,7 @@
 import React from "react";
 import { useTheme } from "../context/ThemeContext";
 
-export default function TopBar() {
+export default function TopBar({ onToggleSidebar }) {
   const { theme, toggleTheme, isTransitioning, transitionDirection } = useTheme();
 
   return (
@@ -42,7 +42,7 @@ export default function TopBar() {
       <header className="topbar">
         {/* Left — Menu Icon + Page Title */}
         <div className="topbar__left">
-          <button className="topbar__menu-btn" aria-label="Menu">
+          <button className="topbar__menu-btn" aria-label="Menu" onClick={onToggleSidebar}>
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <line x1="3" y1="6" x2="21" y2="6" />
               <line x1="3" y1="12" x2="21" y2="12" />

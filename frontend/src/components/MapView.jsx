@@ -77,51 +77,36 @@ const SHAPE_STYLE = {
 
 
 /**
- * DrawControls — sets up leaflet-draw with a stable ref.
- * Uses a controlRef to ensure only one instance exists.
+ * DrawControls — custom React UI for Leaflet Draw.
+ * Uses L.Draw.Polygon and L.Draw.Rectangle directly.
  */
-function DrawControls({ featureGroupRef, onShapeDrawn, onShapeDeleted, onDrawingChange }) {
+function DrawControls({ featureGroupRef, onShapeDrawn, onShapeDeleted, onDrawingChange, isDrawing }) {
   const map = useMap();
-  const controlRef = useRef(null);
   const handlersRef = useRef({ created: null, deleted: null, start: null, stop: null });
+  const drawHandlerRef = useRef(null);
+  const toolbarRef = useRef(null);
 
   useEffect(() => {
-    if (!featureGroupRef.current || controlRef.current) return;
+    if (toolbarRef.current) {
+      L.DomEvent.disableClickPropagation(toolbarRef.current);
+      L.DomEvent.disableScrollPropagation(toolbarRef.current);
+    }
+  }, []);
 
-    const drawControl = new L.Control.Draw({
-      position: "topright",
-      draw: {
-        polygon: {
-          allowIntersection: false,
-          showArea: true,
-          guidelineDistance: 15,
-          shapeOptions: { ...SHAPE_STYLE },
-        },
-        rectangle: {
-          shapeOptions: { ...SHAPE_STYLE },
-        },
-        polyline: false,
-        circle: false,
-        circlemarker: false,
-        marker: false,
-      },
-      edit: {
-        featureGroup: featureGroupRef.current,
-        remove: true,
-        edit: false,
-      },
-    });
+  useEffect(() => {
+    if (!featureGroupRef.current) return;
 
-    map.addControl(drawControl);
-    controlRef.current = drawControl;
-
-    // Handler: shape created
     handlersRef.current.created = (e) => {
       const { layer, layerType } = e;
       featureGroupRef.current.clearLayers();
       featureGroupRef.current.addLayer(layer);
 
-      const coords = layer.getLatLngs()[0].map((ll) => [ll.lat, ll.lng]);
+      // Handle Rectangle correctly (it has a nested array structure like polygon)
+      const latLngs = layerType === "rectangle" || layerType === "polygon" 
+        ? layer.getLatLngs()[0] 
+        : layer.getLatLngs();
+        
+      const coords = latLngs.map((ll) => [ll.lat, ll.lng]);
       if (onShapeDrawn) {
         onShapeDrawn({
           shapeType: layerType === "rectangle" ? "rectangle" : "polygon",
@@ -129,21 +114,20 @@ function DrawControls({ featureGroupRef, onShapeDrawn, onShapeDeleted, onDrawing
         });
       }
       if (onDrawingChange) onDrawingChange(false);
+      drawHandlerRef.current = null;
     };
 
-    // Handler: shape deleted
     handlersRef.current.deleted = () => {
       if (onShapeDeleted) onShapeDeleted();
     };
 
-    // Handler: drawing started
     handlersRef.current.start = () => {
       if (onDrawingChange) onDrawingChange(true);
     };
 
-    // Handler: drawing stopped (cancel or finish)
     handlersRef.current.stop = () => {
       if (onDrawingChange) onDrawingChange(false);
+      drawHandlerRef.current = null;
     };
 
     map.on(L.Draw.Event.CREATED, handlersRef.current.created);
@@ -152,10 +136,6 @@ function DrawControls({ featureGroupRef, onShapeDrawn, onShapeDeleted, onDrawing
     map.on(L.Draw.Event.DRAWSTOP, handlersRef.current.stop);
 
     return () => {
-      if (controlRef.current) {
-        map.removeControl(controlRef.current);
-        controlRef.current = null;
-      }
       map.off(L.Draw.Event.CREATED, handlersRef.current.created);
       map.off(L.Draw.Event.DELETED, handlersRef.current.deleted);
       map.off(L.Draw.Event.DRAWSTART, handlersRef.current.start);
@@ -163,7 +143,57 @@ function DrawControls({ featureGroupRef, onShapeDrawn, onShapeDeleted, onDrawing
     };
   }, [map, featureGroupRef, onShapeDrawn, onShapeDeleted, onDrawingChange]);
 
-  return null;
+  const startPolygon = () => {
+    if (drawHandlerRef.current) drawHandlerRef.current.disable();
+    drawHandlerRef.current = new L.Draw.Polygon(map, {
+      allowIntersection: false,
+      showArea: true,
+      guidelineDistance: 15,
+      shapeOptions: { ...SHAPE_STYLE },
+    });
+    drawHandlerRef.current.enable();
+  };
+
+  const startRectangle = () => {
+    if (drawHandlerRef.current) drawHandlerRef.current.disable();
+    drawHandlerRef.current = new L.Draw.Rectangle(map, {
+      shapeOptions: { ...SHAPE_STYLE },
+    });
+    drawHandlerRef.current.enable();
+  };
+
+  const clearShape = () => {
+    if (drawHandlerRef.current) {
+      drawHandlerRef.current.disable();
+      drawHandlerRef.current = null;
+    }
+    if (featureGroupRef.current) {
+      featureGroupRef.current.clearLayers();
+    }
+    if (onShapeDeleted) onShapeDeleted();
+    if (onDrawingChange) onDrawingChange(false);
+  };
+
+  return (
+    <div className="custom-map-toolbar" ref={toolbarRef}>
+      <button className="custom-map-btn" onClick={startPolygon} title="Draw Polygon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12 2L2 12l10 10 10-10L12 2z"></path>
+        </svg>
+      </button>
+      <button className="custom-map-btn" onClick={startRectangle} title="Draw Rectangle">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+        </svg>
+      </button>
+      <button className="custom-map-btn custom-map-btn--danger" onClick={clearShape} title="Clear Shape">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+        </svg>
+      </button>
+    </div>
+  );
 }
 
 
@@ -403,6 +433,7 @@ export default function MapView({
             onShapeDrawn={onShapeDrawn}
             onShapeDeleted={onShapeDeleted}
             onDrawingChange={onDrawingChange}
+            isDrawing={isDrawing}
           />
           {externalCoords && externalCoords.length >= 2 && (
             <ExternalShape

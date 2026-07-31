@@ -1,6 +1,4 @@
 <div align="center">
-  <img src="frontend/src/assets/repo_img.png" alt="GeoWatch Nexus Dashboard" width="100%" style="border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.15);" />
-
   # GeoWatch Nexus
   **A Satellite-Based Environmental Change Detection and Alert System**
 
@@ -8,6 +6,10 @@
   [![Vite](https://img.shields.io/badge/Vite-B73BFE?style=for-the-badge&logo=vite&logoColor=FFD62E)](https://vitejs.dev/)
   [![Flask](https://img.shields.io/badge/Flask-000000?style=for-the-badge&logo=flask&logoColor=white)](https://flask.palletsprojects.com/)
   [![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+
+  <br />
+
+  <img src="frontend/src/assets/repo_img.png" alt="GeoWatch Nexus Dashboard" width="100%" style="border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.15);" />
 </div>
 
 <br />

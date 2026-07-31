@@ -11,6 +11,12 @@ from dotenv import load_dotenv
 from flask import Flask
 from flask_cors import CORS
 from routes.aoi_routes import aoi_bp
+from routes.analysis_routes import analysis_bp
+from models.database import engine, Base
+import models.aoi  # Import models to ensure they are registered with Base
+
+# Create tables if they don't exist
+Base.metadata.create_all(bind=engine)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -26,6 +32,7 @@ def create_app():
 
     # ── Register Blueprints ───────────────────────────────────────
     app.register_blueprint(aoi_bp)
+    app.register_blueprint(analysis_bp)
 
     # ── Health-check endpoint ─────────────────────────────────────
     @app.route("/api/health")
