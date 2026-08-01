@@ -32,59 +32,6 @@ The project is structured as a monorepo containing two main directories:
 * `/backend` - Python Flask API server.
 * `/frontend` - React application built with Vite.
 
-## 🚀 Getting Started
-
-### Prerequisites
-
-* **Node.js** (v18+ recommended)
-* **Python** (v3.9+ recommended)
-
-### 1. Setting up the Backend
-
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-2. Create and activate a virtual environment (optional but recommended):
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows use: venv\Scripts\activate
-   ```
-3. Install the Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Create a `.env` file in the `backend` directory (ensure this is ignored in git) and add your environment variables:
-   ```env
-   CORS_ORIGINS=http://localhost:5173
-   # Add any third-party API keys here if required (e.g., geocoding providers)
-   ```
-5. Start the Flask development server:
-   ```bash
-   python app.py
-   ```
-   *The server will run on http://localhost:5000*
-
-### 2. Setting up the Frontend
-
-1. Open a new terminal and navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-2. Install the Node dependencies:
-   ```bash
-   npm install
-   ```
-3. Create a `.env` file in the `frontend` directory and define the backend API URL:
-   ```env
-   VITE_API_BASE_URL=http://localhost:5000/api
-   ```
-4. Start the Vite development server:
-   ```bash
-   npm run dev
-   ```
-   *The app will run on http://localhost:5173*
-
 ## 🎨 UI/UX Design System
 
 GeoWatch Nexus utilizes a highly customized vanilla CSS design system (`index.css`) rather than a heavy utility framework like Tailwind. This allows for precise micro-interactions and high-performance CSS animations:
