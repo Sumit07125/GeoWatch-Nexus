@@ -9,11 +9,23 @@ venv/
 .venv/
 env/
 
-# Environment variables
+# Environment variables & Credentials
 .env
+*.json
+credentials.json
+token.json
+satellite-based-*.json
 
 # Data store (auto-generated)
 data/
+
+# Auto-generated image caches and processing folders
+static/
+images/
+downloads/
+aligned_images/
+runs/
+__pycache__/
 
 # IDE
 .vscode/

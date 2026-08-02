@@ -20,3 +20,6 @@ aoi_bp.route("/<aoi_id>", methods=["GET"])(aoi_controller.get_aoi)
 
 # DELETE /api/aoi/<id>   → Delete an AOI
 aoi_bp.route("/<aoi_id>", methods=["DELETE"])(aoi_controller.delete_aoi)
+
+# PUT    /api/aoi/<id>   → Update an AOI
+aoi_bp.route("/<aoi_id>", methods=["PUT"])(aoi_controller.update_aoi)

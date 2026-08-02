@@ -10,8 +10,30 @@ venv/
 .venv/
 env/
 .env
+
+# Ignore Archives and Large Data
 *.zip
+archive.zip
+*.tar.gz
+
+# IGNORE SENSITIVE CREDENTIALS & API KEYS
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!jsconfig.json
+satellite-based-*.json
+credentials.json
+token.json
+client_secret.json
+
+# Gemini Agent / AI Assistant generated folders
+.agents/
+.gemini/
 
 # Note: The /frontend and /backend directories have their own specific .gitignore files.
 backend/ml_models/best_model.pt
 backend/static/
+backend/images/
+backend/downloads/
+backend/aligned_images/

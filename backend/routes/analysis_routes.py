@@ -1,46 +1,107 @@
-from flask import Blueprint, jsonify
-from services import aoi_service
-from services.gee_service import get_aoi_images, download_tensors_for_ml
-from services.inference import generate_and_save_mask
-import numpy as np
+from flask import Blueprint, jsonify, request, Response
+import uuid
+from services.gee_fetcher import fetch_gee_indices
+from services.cv_analyzer import analyze_change
+from services.gdrive_service import list_project_images, download_file_binary
 
-analysis_bp = Blueprint("analysis", __name__, url_prefix="/api/analysis")
+analysis_bp = Blueprint("analysis", __name__, url_prefix="/api")
 
-@analysis_bp.route("/<aoi_id>", methods=["GET"])
-def analyze_aoi(aoi_id):
-    # 1. Fetch AOI from database
-    aoi = aoi_service.get_aoi_by_id(aoi_id)
-    if not aoi:
-        return jsonify({"error": "AOI not found"}), 404
-        
-    coordinates = aoi["coordinates"]
+@analysis_bp.route("/analyze-change", methods=["POST"])
+def analyze_change_route():
+    data = request.json
+    lat = data.get("latitude")
+    lon = data.get("longitude")
+    start_year = data.get("start_year", 2016)
+    end_year = data.get("end_year", 2026)
+    index_type = data.get("index_type", "NDVI")
     
-    # 2. Get Google Earth Engine RGB Images for Display
+    if not all([lat, lon]):
+        return jsonify({"error": "Latitude and Longitude are required."}), 400
+        
+    session_id = str(uuid.uuid4())
+    
     try:
-        urls = get_aoi_images(coordinates)
+        # 1. Fetch images from Earth Engine
+        gee_results = fetch_gee_indices(lat, lon, start_year, end_year, index_type, session_id)
+        
+        # 2. Analyze change with OpenCV using raw memory bytes
+        cv_results = analyze_change(gee_results["idx_bytes1"], gee_results["idx_bytes2"], session_id)
+        
+        result = {
+            "before_rgb": gee_results["rgb_url1"],
+            "after_rgb": gee_results["rgb_url2"],
+            "before_index": gee_results["idx_url1"],
+            "after_index": gee_results["idx_url2"],
+            "mask_url": cv_results["mask_url"],
+            "percentage_changed": cv_results["percentage_changed"],
+            "area_km2": cv_results["area_km2"],
+            "index_type": index_type
+        }
+        
+        return jsonify(result), 200
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@analysis_bp.route("/drive/projects/<project_name>/dates", methods=["GET"])
+def get_project_dates(project_name):
+    try:
+        data = list_project_images(project_name)
+        return jsonify({"dates": data}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@analysis_bp.route("/drive/files/<path:file_id>", methods=["GET"])
+def get_drive_file(file_id):
+    try:
+        binary_data = download_file_binary(file_id)
+        return Response(binary_data, mimetype="image/png")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+import os
+from services.gdrive_service import LOCAL_DRIVE_PATH
+
+@analysis_bp.route("/drive/projects/<project_name>/statistics", methods=["GET"])
+def get_project_statistics(project_name):
+    try:
+        data = list_project_images(project_name)
+        if not data:
+            return jsonify({"statistics": []}), 200
+            
+        # Data comes sorted descending (newest first), reverse it for chronological calculation
+        data_asc = list(reversed(data))
         
-    # 3. Download 13-band tensors for PyTorch
-    current_arr, hist_arr = download_tensors_for_ml(coordinates)
-    
-    mask_url = None
-    change_percentage = 0.0
-    
-    if current_arr is not None and hist_arr is not None:
-        try:
-            mask_url = generate_and_save_mask(current_arr, hist_arr, aoi_id)
+        statistics = []
+        
+        for i in range(1, len(data_asc)):
+            prev = data_asc[i-1]
+            curr = data_asc[i]
             
-            # Since mask is stored as a URL, we need a way to get the change %
-            # We can re-calculate or just mock it for now since we're using a mock mask
-            change_percentage = 5.2 # Mock value
-        except Exception as e:
-            print(f"Failed to generate mask: {e}")
-            
-    return jsonify({
-        "aoi_id": aoi_id,
-        "current_url": urls.get("current_url"),
-        "historical_url": urls.get("historical_url"),
-        "mask_url": mask_url,
-        "change_percentage": change_percentage
-    }), 200
+            if 'index.png' in prev['images'] and 'index.png' in curr['images']:
+                # Construct absolute paths
+                idx_path1 = os.path.join(LOCAL_DRIVE_PATH, prev['images']['index.png'])
+                idx_path2 = os.path.join(LOCAL_DRIVE_PATH, curr['images']['index.png'])
+                
+                try:
+                    # Calculate change between previous and current date
+                    session_id = str(uuid.uuid4())
+                    cv_results = analyze_change(idx_path1, idx_path2, session_id)
+                    
+                    statistics.append({
+                        "period": f"{prev['date']} to {curr['date']}",
+                        "from_date": prev['date'],
+                        "to_date": curr['date'],
+                        "percentage_changed": cv_results["percentage_changed"],
+                        "area_km2": cv_results["area_km2"],
+                        "mask_url": cv_results["mask_url"]
+                    })
+                except Exception as e:
+                    print(f"Error calculating stats for {prev['date']} to {curr['date']}: {e}")
+                    
+        # Reverse back so newest is first in UI
+        statistics.reverse()
+        
+        return jsonify({"statistics": statistics}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

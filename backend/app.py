@@ -10,6 +10,7 @@ import os
 from dotenv import load_dotenv
 from flask import Flask
 from flask_cors import CORS
+from services.scheduler import start_scheduler
 from routes.aoi_routes import aoi_bp
 from routes.analysis_routes import analysis_bp
 from models.database import engine, Base
@@ -26,9 +27,8 @@ def create_app():
     """Application factory — creates and configures the Flask app."""
     app = Flask(__name__)
 
-    # Read CORS origins from .env (comma-separated)
-    origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
-    CORS(app, origins=[o.strip() for o in origins])
+    # Allow all origins for development to prevent CORS issues
+    CORS(app)
 
     # ── Register Blueprints ───────────────────────────────────────
     app.register_blueprint(aoi_bp)
@@ -43,6 +43,9 @@ def create_app():
 
 
 if __name__ == "__main__":
+    # Start the background tracking scheduler
+    start_scheduler()
+
     app = create_app()
     port = int(os.getenv("FLASK_PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "True").lower() == "true"

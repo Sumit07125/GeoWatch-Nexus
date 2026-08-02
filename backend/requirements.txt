@@ -4,9 +4,7 @@ python-dotenv==1.1.*
 SQLAlchemy==2.0.*
 PyMySQL==1.1.*
 earthengine-api
-torch
-torchvision
-Pillow
+opencv-python
 numpy
-tifffile
 requests
+Pillow

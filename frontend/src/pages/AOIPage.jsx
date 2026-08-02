@@ -1,140 +1,135 @@
-/**
- * AOIPage (v4 — Dark Mode + Premium UI)
- * ──────────────────────────────────────
- * Layout: Sidebar (200px teal) | [ TopBar (white/dark) / Content (padded) ]
- * Supports both polygon (3+ pts) and rectangle (2-corner) manual input.
- */
-
-import React, { useState, useCallback } from "react";
+import React, { useState, useCallback, useRef, useEffect } from "react";
 import Sidebar from "../components/Sidebar";
 import TopBar from "../components/TopBar";
 import MapView from "../components/MapView";
 import AOIPanel from "../components/AOIPanel";
 import InfoBadge from "../components/InfoBadge";
-import { saveAOI } from "../api/aoiApi";
-
-/**
- * Calculate area in hectares from coordinate array.
- * Handles both polygon (3+ pts) and rectangle (2-point bounding box).
- */
-function calculateAreaHectares(coords, shapeType) {
-  if (!coords || coords.length < 2) return 0;
-
-  // Expand 2-point rectangle to 4 corners for area calculation
-  let pts = coords;
-  if (shapeType === "rectangle" && coords.length === 2) {
-    const [lat1, lng1] = coords[0];
-    const [lat2, lng2] = coords[1];
-    pts = [
-      [lat1, lng1],
-      [lat1, lng2],
-      [lat2, lng2],
-      [lat2, lng1],
-    ];
-  }
-
-  if (pts.length < 3) return 0;
-
-  const R = 6_371_000;
-  const toRad = (deg) => (deg * Math.PI) / 180;
-  const n = pts.length;
-  let area = 0;
-  for (let i = 0; i < n; i++) {
-    const lat1 = toRad(pts[i][0]);
-    const lng1 = toRad(pts[i][1]);
-    const lat2 = toRad(pts[(i + 1) % n][0]);
-    const lng2 = toRad(pts[(i + 1) % n][1]);
-    area += (lng2 - lng1) * (2 + Math.sin(lat1) + Math.sin(lat2));
-  }
-  area = (Math.abs(area) * R * R) / 2;
-  return Math.round((area / 10_000) * 100) / 100;
-}
+import { saveAOI, forwardGeocode } from "../api/aoiApi";
 
 export default function AOIPage() {
-  const [shapeType, setShapeType] = useState(null);
-  const [coordinates, setCoordinates] = useState([]);
-  const [areaHectares, setAreaHectares] = useState(0);
+  const [latitude, setLatitude] = useState(37.38);
+  const [longitude, setLongitude] = useState(-122.08);
+  const [panTrigger, setPanTrigger] = useState(0);
   const [isSaving, setIsSaving] = useState(false);
-  const [isDrawing, setIsDrawing] = useState(false);
   const [locationName, setLocationName] = useState(null);
-  const [externalCoords, setExternalCoords] = useState(null);
-  const [externalShapeType, setExternalShapeType] = useState(null);
   const [toast, setToast] = useState({ visible: false, type: "", message: "" });
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
+  const searchDebounceRef = useRef(null);
+  const searchWrapperRef = useRef(null);
+
+  // Close search dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (searchWrapperRef.current && !searchWrapperRef.current.contains(e.target)) {
+        setIsSearchOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const handleSearch = async (query) => {
+    if (!query || query.length < 2) {
+      setSearchResults([]);
+      setIsSearchOpen(false);
+      return;
+    }
+    setIsSearching(true);
+    try {
+      const data = await forwardGeocode(query);
+      if (data && data.length > 0) {
+        setSearchResults(data.slice(0, 5));
+        setIsSearchOpen(true);
+      } else {
+        setSearchResults([]);
+        setIsSearchOpen(true);
+      }
+    } catch {
+      setSearchResults([]);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const onSearchInputChange = (e) => {
+    const val = e.target.value;
+    setSearchQuery(val);
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => handleSearch(val), 400);
+  };
+
+  const handleResultClick = (result) => {
+    const lat = parseFloat(result.lat);
+    const lng = parseFloat(result.lon);
+    setLatitude(lat);
+    setLongitude(lng);
+    
+    // Auto trigger map update
+    setTimeout(() => {
+      setPanTrigger(prev => prev + 1);
+    }, 100);
+
+    const name = result.display_name.split(",").slice(0, 2).join(",");
+    setSearchQuery(name);
+    setIsSearchOpen(false);
+  };
 
   const showToast = useCallback((type, message) => {
     setToast({ visible: true, type, message });
     setTimeout(() => setToast({ visible: false, type: "", message: "" }), 3000);
   }, []);
 
-  const handleShapeDrawn = useCallback((data) => {
-    setShapeType(data.shapeType);
-    setCoordinates(data.coordinates);
-    setAreaHectares(calculateAreaHectares(data.coordinates, data.shapeType));
-    setExternalCoords(null);
-    setExternalShapeType(null);
-  }, []);
+  const handleLocationChange = (field, value) => {
+    if (field === "latitude") setLatitude(value);
+    if (field === "longitude") setLongitude(value);
+  };
 
-  const handleShapeDeleted = useCallback(() => {
-    setShapeType(null);
-    setCoordinates([]);
-    setAreaHectares(0);
-    setExternalCoords(null);
-    setExternalShapeType(null);
+  const handleMapClick = (lat, lon) => {
+    setLatitude(parseFloat(lat.toFixed(5)));
+    setLongitude(parseFloat(lon.toFixed(5)));
     setLocationName(null);
-  }, []);
+  };
 
-  const handleLocationClick = useCallback((locData) => {
-    setLocationName(locData.name);
-  }, []);
-
-  const handleDrawingChange = useCallback((drawing) => {
-    setIsDrawing(drawing);
-    if (drawing) setLocationName(null);
-  }, []);
-
-  const handleManualApply = useCallback((data) => {
-    setShapeType(data.shapeType);
-    setCoordinates(data.coordinates);
-    setAreaHectares(calculateAreaHectares(data.coordinates, data.shapeType));
-    setExternalCoords(data.coordinates);
-    setExternalShapeType(data.shapeType);
-  }, []);
+  const handleShowOnMap = () => {
+    setPanTrigger(prev => prev + 1);
+  };
 
   const handleSave = useCallback(
     async ({ name, description }) => {
       setIsSaving(true);
       try {
         await saveAOI({
-          name: name || "Untitled AOI",
+          name: name || "Untitled Project",
           description,
-          shape_type: shapeType,
-          coordinates,
+          shape_type: "point",
+          coordinates: [[latitude, longitude]],
         });
-        showToast("success", "AOI saved successfully!");
+        showToast("success", "Project coordinates saved successfully!");
       } catch (err) {
         const message =
           err.response?.data?.error ||
-          "Failed to save AOI. Is the backend running?";
+          "Failed to save coordinates. Is the backend running?";
         showToast("error", message);
       } finally {
         setIsSaving(false);
       }
     },
-    [shapeType, coordinates, showToast]
+    [latitude, longitude, showToast]
   );
 
   return (
     <div className={`app-layout ${isSidebarCollapsed ? 'app-layout--collapsed' : ''}`}>
-      {/* Sidebar */}
       <Sidebar collapsed={isSidebarCollapsed} />
 
-      {/* Main Area */}
       <div className="app-layout__main">
-        {/* Top Bar */}
         <TopBar onToggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} />
 
-        {/* Welcome Banner */}
         <div className="app-layout__body">
           <div className="welcome-banner">
             <div className="welcome-banner__cloud welcome-banner__cloud--1" />
@@ -153,7 +148,7 @@ export default function AOIPage() {
                 Welcome back, Researcher
               </h2>
               <p className="welcome-banner__sub">
-                Define your Area of Interest to begin satellite monitoring.
+                Define the coordinate center for your satellite monitoring.
               </p>
             </div>
             <div className="welcome-banner__right">
@@ -161,39 +156,103 @@ export default function AOIPage() {
                 <span className="welcome-banner__stat-num">1</span>
                 <span className="welcome-banner__stat-label">Step 1 of 4</span>
               </div>
-              <div className="welcome-banner__step-tag">Define AOI</div>
+              <div className="welcome-banner__step-tag">Define Point</div>
             </div>
           </div>
 
-          {/* Content — Map + Panel */}
-          <div className="aoi-content">
+          {/* ── Search Bar Section (Absolute Overlap) ───────────────────────────────────── */}
+          <div style={{ position: "relative", zIndex: 1000, height: 0 }} ref={searchWrapperRef}>
+            <div 
+              style={{ 
+                position: "absolute", 
+                top: "-28px", 
+                left: "32px", 
+                width: "100%",
+                maxWidth: "340px",
+              }} 
+            >
+              <div style={{ 
+                position: "relative", 
+                width: "100%",
+                borderRadius: "38px",
+                border: "8px solid var(--bg-body)",
+                boxShadow: "0 8px 24px rgba(0,0,0,0.08)",
+                background: "var(--bg-white)"
+              }}>
+                <input
+                  type="text"
+                  style={{ 
+                    width: "100%", 
+                    padding: "10px 16px 10px 40px", 
+                    borderRadius: "30px",
+                    border: "none", 
+                    background: "transparent", 
+                    color: "var(--text-dark)",
+                    fontSize: "13px",
+                    outline: "none"
+                  }}
+                  placeholder="Search city or region..."
+                  value={searchQuery}
+                  onChange={onSearchInputChange}
+                  onFocus={() => searchResults.length > 0 && setIsSearchOpen(true)}
+                />
+                <svg style={{ position: "absolute", left: "16px", top: "11px", color: "var(--text-muted)" }} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="8" />
+                  <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                </svg>
+                {isSearching && (
+                  <div style={{ position: "absolute", right: "12px", top: "11px", width: "16px", height: "16px", border: "2px solid var(--border)", borderTopColor: "var(--accent)", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
+                )}
+
+                {/* Results Dropdown */}
+                {isSearchOpen && (
+                  <div style={{ position: "absolute", top: "100%", left: "0px", right: "0px", marginTop: "8px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "16px", boxShadow: "var(--shadow-dropdown)", zIndex: 100, overflow: "hidden" }}>
+                    {searchResults.length === 0 ? (
+                      <div style={{ padding: "16px", fontSize: "14px", color: "var(--text-muted)", textAlign: "center" }}>No results found</div>
+                    ) : (
+                      searchResults.map((res, i) => (
+                        <button
+                          key={i}
+                          onClick={() => handleResultClick(res)}
+                          style={{ display: "block", width: "100%", textAlign: "left", padding: "14px 20px", fontSize: "14px", color: "var(--text-dark)", background: "transparent", border: "none", borderBottom: i < searchResults.length - 1 ? "1px solid var(--border)" : "none", cursor: "pointer" }}
+                          onMouseEnter={(e) => e.currentTarget.style.background = "var(--bg-body)"}
+                          onMouseLeave={(e) => e.currentTarget.style.background = "transparent"}
+                        >
+                          {res.display_name}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="aoi-content" style={{ marginTop: "12px" }}>
             <div className="aoi-content__map-wrapper">
               <MapView
-                onShapeDrawn={handleShapeDrawn}
-                onShapeDeleted={handleShapeDeleted}
-                onLocationClick={handleLocationClick}
-                externalCoords={externalCoords}
-                externalShapeType={externalShapeType}
-                isDrawing={isDrawing}
-                onDrawingChange={handleDrawingChange}
+                lat={latitude}
+                lon={longitude}
+                onLocationClick={handleMapClick}
+                panTrigger={panTrigger}
+                style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, height: "100%", borderRadius: "var(--r-xl)", border: "none" }}
               />
               <InfoBadge />
             </div>
 
             <AOIPanel
-              shapeType={shapeType}
-              coordinates={coordinates}
-              areaHectares={areaHectares}
+              latitude={latitude}
+              longitude={longitude}
               locationName={locationName}
+              onLocationChange={handleLocationChange}
+              onShowOnMap={handleShowOnMap}
               onSave={handleSave}
-              onManualApply={handleManualApply}
               isSaving={isSaving}
             />
           </div>
         </div>
       </div>
 
-      {/* Toast */}
       <div
         className={`toast toast--${toast.type} ${
           toast.visible ? "toast--visible" : ""

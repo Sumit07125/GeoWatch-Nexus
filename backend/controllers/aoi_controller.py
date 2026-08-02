@@ -48,3 +48,17 @@ def delete_aoi(aoi_id):
         return jsonify({"error": "AOI not found"}), 404
 
     return jsonify({"message": "AOI deleted successfully"}), 200
+
+
+def update_aoi(aoi_id):
+    """Handle PUT /api/aoi/<id> — update an AOI name/description."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body must be valid JSON"}), 400
+
+    aoi, error = aoi_service.update_aoi(aoi_id, data)
+    
+    if error:
+        return jsonify({"error": error}), 400
+
+    return jsonify({"message": "AOI updated successfully", "aoi": aoi}), 200

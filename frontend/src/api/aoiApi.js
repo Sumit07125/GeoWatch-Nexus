@@ -54,6 +54,27 @@ export async function deleteAOI(id) {
 }
 
 /**
+ * Update an AOI by its ID.
+ * @param {string} id
+ * @param {Object} aoiData
+ * @returns {Promise<Object>}
+ */
+export async function updateAOI(id, aoiData) {
+  const response = await API.put(`/aoi/${id}`, aoiData);
+  return response.data;
+}
+
+/**
+ * Fetch chronological change statistics for a project.
+ * @param {string} projectName
+ * @returns {Promise<Object>} { statistics: [...] }
+ */
+export async function fetchProjectStatistics(projectName) {
+  const response = await API.get(`/drive/projects/${encodeURIComponent(projectName)}/statistics`);
+  return response.data;
+}
+
+/**
  * Reverse geocode a lat/lng position using Nominatim.
  * Returns the display name of the location (free, no API key).
  * @param {number} lat
