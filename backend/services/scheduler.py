@@ -17,7 +17,7 @@ def analyze_date_for_project(db, aoi, target_date_str):
         images_data = list_project_images(aoi.name)
         for data in images_data:
             if data['date'] == target_date_str and 'index.png' in data['images']:
-                print(f"Skipping {aoi.name} on {target_date_str}, already exists locally.")
+                # Silent skip to avoid console spam
                 return
         print(f"Running Earth Engine Analysis for {aoi.name} on {target_date_str}...")
         
@@ -26,25 +26,14 @@ def analyze_date_for_project(db, aoi, target_date_str):
         
         rgb_url, index_url = fetch_gee_image_for_date(lat, lon, target_date_str, index_type)
         
-        # Using a temporary directory to save images and upload
-        with tempfile.TemporaryDirectory() as temp_dir:
-            rgb_path = os.path.join(temp_dir, 'rgb.png')
-            index_path = os.path.join(temp_dir, 'index.png')
-            
-            # Since these are URLs, we need to download them to upload to GDrive
-            import requests
-            
-            res_rgb = requests.get(rgb_url)
-            with open(rgb_path, 'wb') as f:
-                f.write(res_rgb.content)
-                
-            res_index = requests.get(index_url)
-            with open(index_path, 'wb') as f:
-                f.write(res_index.content)
+        import requests
+        
+        res_rgb = requests.get(rgb_url)
+        res_index = requests.get(index_url)
 
-            # Upload to Google Drive
-            upload_image(aoi.name, target_date_str, rgb_path, 'rgb.png')
-            upload_image(aoi.name, target_date_str, index_path, 'index.png')
+        # Upload bytes directly to Google Drive
+        upload_image(aoi.name, target_date_str, res_rgb.content, 'rgb.png', is_bytes=True)
+        upload_image(aoi.name, target_date_str, res_index.content, 'index.png', is_bytes=True)
             
         print(f"Successfully processed and uploaded {aoi.name} on {target_date_str}.")
 

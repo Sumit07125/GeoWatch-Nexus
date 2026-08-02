@@ -60,7 +60,6 @@ def get_drive_file(file_id):
         return jsonify({"error": str(e)}), 500
 
 import os
-from services.gdrive_service import LOCAL_DRIVE_PATH
 
 @analysis_bp.route("/drive/projects/<project_name>/statistics", methods=["GET"])
 def get_project_statistics(project_name):
@@ -79,14 +78,17 @@ def get_project_statistics(project_name):
             curr = data_asc[i]
             
             if 'index.png' in prev['images'] and 'index.png' in curr['images']:
-                # Construct absolute paths
-                idx_path1 = os.path.join(LOCAL_DRIVE_PATH, prev['images']['index.png'])
-                idx_path2 = os.path.join(LOCAL_DRIVE_PATH, curr['images']['index.png'])
+                idx_id1 = prev['images']['index.png']
+                idx_id2 = curr['images']['index.png']
                 
                 try:
-                    # Calculate change between previous and current date
+                    # Download bytes from Google Drive
+                    idx_bytes1 = download_file_binary(idx_id1)
+                    idx_bytes2 = download_file_binary(idx_id2)
+                    
+                    # Calculate change between previous and current date in memory
                     session_id = str(uuid.uuid4())
-                    cv_results = analyze_change(idx_path1, idx_path2, session_id)
+                    cv_results = analyze_change(idx_bytes1, idx_bytes2, session_id)
                     
                     statistics.append({
                         "period": f"{prev['date']} to {curr['date']}",
