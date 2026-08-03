@@ -34,10 +34,15 @@ def create_app():
     app.register_blueprint(aoi_bp)
     app.register_blueprint(analysis_bp)
 
-    # ── Health-check endpoint ─────────────────────────────────────
+    # ── Health-check & Logs endpoint ──────────────────────────────
     @app.route("/api/health")
     def health():
         return {"status": "ok", "service": "EarthSentry API"}
+        
+    @app.route("/api/logs")
+    def get_system_logs():
+        from services.logger_service import get_logs
+        return {"logs": get_logs()}
 
     return app
 

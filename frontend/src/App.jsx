@@ -11,6 +11,8 @@ import AnalysisDashboard from "./pages/AnalysisDashboard";
 import MonitoringPage from "./pages/MonitoringPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
 
+import SatelliteDataPage from "./pages/SatelliteDataPage";
+
 function App() {
   return (
     <BrowserRouter>
@@ -21,6 +23,7 @@ function App() {
         <Route path="/monitoring" element={<MonitoringPage />} />
         <Route path="/analytics" element={<AnalyticsPage />} />
         <Route path="/analysis/:id" element={<AnalysisDashboard />} />
+        <Route path="/satellite" element={<SatelliteDataPage />} />
       </Routes>
     </BrowserRouter>
   );

@@ -1,6 +1,7 @@
 import ee
 import os
 import requests
+from .cloud_masking import get_cloud_free_mosaic_for_year, get_best_cloud_free_image
 
 _INITIALIZED = False
 
@@ -23,14 +24,9 @@ def fetch_gee_indices(lat, lon, start_year, end_year, index_type, session_id):
     point = ee.Geometry.Point([lon, lat])
     roi = point.buffer(2560).bounds()
     
-    s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    
-    def get_composite(year):
-        # We take the median of the year to get a clear composite
-        return s2.filterBounds(roi).filterDate(f"{year}-01-01", f"{year}-12-31").median().clip(roi)
-        
-    img1 = get_composite(start_year)
-    img2 = get_composite(end_year)
+    # Use the robust cloud masking module to get annual composites
+    img1 = get_cloud_free_mosaic_for_year(roi, start_year)
+    img2 = get_cloud_free_mosaic_for_year(roi, end_year)
     
     if index_type == "NDVI":
         idx1 = img1.normalizedDifference(['B8', 'B4'])
@@ -76,14 +72,11 @@ def fetch_gee_image_for_date(lat, lon, target_date_str, index_type):
     point = ee.Geometry.Point([lon, lat])
     roi = point.buffer(2560).bounds()
     
-    s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    # Use the robust cloud masking module with automatic fallback and expanding search window
+    img = get_best_cloud_free_image(roi, target_date_str, cloud_threshold=0.60, max_cloud_pct=20)
     
-    import datetime
-    target_date = datetime.datetime.strptime(target_date_str, "%Y-%m-%d")
-    start = (target_date - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
-    end = (target_date + datetime.timedelta(days=15)).strftime("%Y-%m-%d")
-    
-    img = s2.filterBounds(roi).filterDate(start, end).median().clip(roi)
+    if img is None:
+        raise ValueError("Could not find any Sentinel-2 imagery for this region and date.")
     
     if index_type == "NDVI":
         idx = img.normalizedDifference(['B8', 'B4'])

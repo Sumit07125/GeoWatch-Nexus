@@ -21,9 +21,14 @@ This repository contains both the **Flask Backend** (API) and the **Vite + React
 ## 🌟 Key Features
 
 * **Advanced AOI Selection**: Select monitoring regions using a fully interactive Leaflet map (Polygon & Rectangle drawing tools) or manual coordinate entry.
+* **Google Earth Engine Integration**: Dynamically fetches Sentinel-2 Harmonized satellite imagery and computes complex indices (like NDVI) on the fly via Google's Python API.
+* **Server-Side ML Cloud Masking**: Utilizes Google's state-of-the-art Cloud Score+ algorithm to strip cloudy pixels and dynamically build clean median composites.
+* **OpenCV Change Detection**: Computes pixel-perfect mathematical differences between temporal captures to track precise Area Loss and Recovery over time.
+* **Automated Python Scheduler**: A background thread continuously evaluates active projects and automatically triggers satellite pipelines on their required schedule.
+* **Data Analytics Dashboard**: A rich React interface featuring Recharts (area/bar charts), interactive timeline roadmaps, and side-by-side zoomable image comparison panes.
+* **Real-time Satellite Stream**: A dedicated terminal-like UI that streams background processing domain logs (fetching, OpenCV comparing, database saves) to the frontend in real time.
 * **Premium Celestial Theme (v5)**: A state-of-the-art UI featuring a "Glassmorphism" aesthetic, complete with a beautifully animated Day/Night toggle that orchestrates a full-screen Sunset/Moonrise transition.
-* **Dynamic Night Sky**: Dark mode features a procedurally animated twinkling star field and crescent moon for a deeply immersive satellite monitoring experience.
-* **Robust Backend API**: Built with Python/Flask, structured with a scalable service-controller pattern for handling geocoding and geospatial data.
+* **Robust Backend API**: Built with Python/Flask, structured with a scalable service-controller pattern using SQLAlchemy & SQLite.
 
 ## 📁 Repository Structure
 

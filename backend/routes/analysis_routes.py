@@ -2,7 +2,8 @@ from flask import Blueprint, jsonify, request, Response
 import uuid
 from services.gee_fetcher import fetch_gee_indices
 from services.cv_analyzer import analyze_change
-from services.gdrive_service import list_project_images, download_file_binary
+from models.database import get_db
+from models.aoi import AOI, AOIAnalysis, AOIImage
 
 analysis_bp = Blueprint("analysis", __name__, url_prefix="/api")
 
@@ -45,65 +46,90 @@ def analyze_change_route():
 
 @analysis_bp.route("/drive/projects/<project_name>/dates", methods=["GET"])
 def get_project_dates(project_name):
+    db = next(get_db())
     try:
-        data = list_project_images(project_name)
-        return jsonify({"dates": data}), 200
+        aoi = db.query(AOI).filter(AOI.name == project_name).first()
+        if not aoi:
+            return jsonify({"dates": []}), 200
+            
+        images = db.query(AOIImage).filter(AOIImage.aoi_id == aoi.id).order_by(AOIImage.date.desc()).all()
+        dates_data = []
+        for img in images:
+            dates_data.append({
+                "date": img.date,
+                "images": {
+                    "rgb.png": f"/api/analysis/image/{img.id}/rgb",
+                    "index.png": f"/api/analysis/image/{img.id}/index"
+                }
+            })
+        return jsonify({"dates": dates_data}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
 
-@analysis_bp.route("/drive/files/<path:file_id>", methods=["GET"])
-def get_drive_file(file_id):
+@analysis_bp.route("/analysis/mask/<analysis_id>", methods=["GET"])
+def get_mask_file(analysis_id):
+    db = next(get_db())
     try:
-        binary_data = download_file_binary(file_id)
+        analysis = db.query(AOIAnalysis).filter(AOIAnalysis.id == analysis_id).first()
+        if not analysis:
+            return jsonify({"error": "Not found"}), 404
+        return Response(analysis.mask_image, mimetype="image/png")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@analysis_bp.route("/analysis/image/<image_id>/<image_type>", methods=["GET"])
+def get_aoi_image(image_id, image_type):
+    db = next(get_db())
+    try:
+        img = db.query(AOIImage).filter(AOIImage.id == image_id).first()
+        if not img:
+            return jsonify({"error": "Not found"}), 404
+            
+        binary_data = img.rgb_image if image_type == 'rgb' else img.index_image
         return Response(binary_data, mimetype="image/png")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
 
 import os
 
 @analysis_bp.route("/drive/projects/<project_name>/statistics", methods=["GET"])
 def get_project_statistics(project_name):
+    db = next(get_db())
     try:
-        data = list_project_images(project_name)
-        if not data:
+        aoi = db.query(AOI).filter(AOI.name == project_name).first()
+        
+        if not aoi:
             return jsonify({"statistics": []}), 200
             
-        # Data comes sorted descending (newest first), reverse it for chronological calculation
-        data_asc = list(reversed(data))
+        analyses = db.query(AOIAnalysis).filter(AOIAnalysis.aoi_id == aoi.id).order_by(AOIAnalysis.to_date.desc()).all()
         
         statistics = []
-        
-        for i in range(1, len(data_asc)):
-            prev = data_asc[i-1]
-            curr = data_asc[i]
+        for analysis in analyses:
+            # We serve the image directly via our new DB route
+            mask_url = f"http://localhost:5000/api/analysis/mask/{analysis.id}"
             
-            if 'index.png' in prev['images'] and 'index.png' in curr['images']:
-                idx_id1 = prev['images']['index.png']
-                idx_id2 = curr['images']['index.png']
-                
-                try:
-                    # Download bytes from Google Drive
-                    idx_bytes1 = download_file_binary(idx_id1)
-                    idx_bytes2 = download_file_binary(idx_id2)
-                    
-                    # Calculate change between previous and current date in memory
-                    session_id = str(uuid.uuid4())
-                    cv_results = analyze_change(idx_bytes1, idx_bytes2, session_id)
-                    
-                    statistics.append({
-                        "period": f"{prev['date']} to {curr['date']}",
-                        "from_date": prev['date'],
-                        "to_date": curr['date'],
-                        "percentage_changed": cv_results["percentage_changed"],
-                        "area_km2": cv_results["area_km2"],
-                        "mask_url": cv_results["mask_url"]
-                    })
-                except Exception as e:
-                    print(f"Error calculating stats for {prev['date']} to {curr['date']}: {e}")
-                    
-        # Reverse back so newest is first in UI
-        statistics.reverse()
-        
+            statistics.append({
+                "period": f"{analysis.from_date} to {analysis.to_date}",
+                "from_date": analysis.from_date,
+                "to_date": analysis.to_date,
+                "percentage_changed": analysis.percentage_changed,
+                "area_km2": analysis.area_km2,
+                "recovery_area_km2": analysis.recovery_area_km2,
+                "mean_index": analysis.mean_index,
+                "barren_percent": analysis.barren_percent,
+                "sparse_percent": analysis.sparse_percent,
+                "dense_percent": analysis.dense_percent,
+                "mask_url": mask_url
+            })
+            
         return jsonify({"statistics": statistics}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
