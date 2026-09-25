@@ -224,24 +224,52 @@ _STALE_FETCH_MINUTES  = 20    # mark as error if stuck in 'fetching' longer than
 
 def _mark_pair_error(pair_id: str, message: str) -> None:
     """
-    Mark a pair as 'error' using a fresh, independent DB session.
+    Mark an active acquisition as ``error`` without overwriting a
+    terminal state such as ``done``.
 
-    Called from the except block of _do_fetch so that a dirty/expired
-    main session cannot prevent the error state from being persisted.
+    The transition is intentionally conditional:
+        pending  -> error    allowed
+        fetching -> error    allowed
+        done     -> error    forbidden
+        error    -> error    forbidden
+
+    This prevents the outer timeout/error handler from racing with the inner
+    acquisition worker and changing a successfully completed pair from
+    ``done`` back to ``error``.
+
+    A fresh, independent DB session is used so that an expired/dirty worker
+    session cannot prevent the terminal error state from being persisted.
+    The error progress artifact is written only when the database transition
+    actually succeeds.
     """
+    error_message = str(message)[:1000]
     db2 = SessionLocal()
     try:
-        pair = db2.get(AOIImagePair, pair_id)
-        if pair:
-            pair.status = "error"
-            pair.error_message = str(message)[:1000]
-            db2.commit()
+        rows_updated = db2.query(AOIImagePair).filter(
+            AOIImagePair.id == pair_id,
+            AOIImagePair.status.in_(("pending", "fetching")),
+        ).update(
+            {
+                "status": "error",
+                "error_message": error_message,
+            },
+            synchronize_session=False,
+        )
+
+        if rows_updated != 1:
+            db2.rollback()
+            return
+
+        db2.commit()
+
     except Exception:
         db2.rollback()
+        return
+
     finally:
         db2.close()
 
-    _write_progress(pair_id, str(message), state="error")
+    _write_progress(pair_id, error_message, state="error")
 
 
 
