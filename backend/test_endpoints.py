@@ -20,7 +20,14 @@ print(f"HTTP {r1.status_code}  content-type: {ct}  bytes: {len(r1.content)}")
 assert r1.status_code == 200 and 'image/png' in ct
 
 print("\n=== TEST 2: threshold=0.28 ===")
-r2 = requests.post(f'{BASE}/images/{pair_id}/threshold', json={'threshold': 0.28})
+for attempt in range(3):
+    try:
+        r2 = requests.post(f'{BASE}/images/{pair_id}/threshold', json={'threshold': 0.28}, timeout=30)
+        break
+    except requests.exceptions.ConnectionError:
+        print(f"  Attempt {attempt+1} failed (model loading?), retrying...")
+        time.sleep(3)
+
 print(f"HTTP {r2.status_code}")
 assert r2.status_code == 200
 d2 = r2.json()

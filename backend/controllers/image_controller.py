@@ -59,16 +59,14 @@ ANALYSIS_FILENAME = "analysis.json"
 
 # Fixed UI legend for the multicolor change-type mask.
 # The model checkpoint is binary change/no-change; these 7 display classes
-# are produced by the post-processing/change-typing stage.
 CHANGE_LEGEND = {
-    "0": {"name": "no_change", "label": "No change", "color": "#808080"},
+    "0": {"name": "no_change", "label": "No change", "color": "#000000"},
     "1": {"name": "water_gain", "label": "Water gain", "color": "#1565C0"},
     "2": {"name": "water_loss", "label": "Water loss", "color": "#4FC3F7"},
     "3": {"name": "construction", "label": "Construction", "color": "#FF9800"},
     "4": {"name": "veg_loss", "label": "Vegetation loss", "color": "#E53935"},
     "5": {"name": "veg_gain", "label": "Vegetation gain", "color": "#43A047"},
     "6": {"name": "other", "label": "Other change", "color": "#8E44AD"},
-    "255": {"name": "uncertain", "label": "Uncertain", "color": "#BDBDBD"},
 }
 
 
@@ -280,7 +278,31 @@ def _do_fetch(
                 _result["error"] = "Image pair record not found"
                 return
 
-            _update_pair_status(pair_id, "fetching")
+            # Atomically claim the pair:
+            # pending -> fetching
+            #
+            # If another thread already moved the pair to error/done,
+            # do not resurrect it back to fetching.
+            rows_claimed = db.query(AOIImagePair).filter(
+                AOIImagePair.id == pair_id,
+                AOIImagePair.status == "pending",
+            ).update(
+                {
+                    "status": "fetching",
+                    "error_message": None,
+                },
+                synchronize_session=False,
+            )
+
+            if rows_claimed != 1:
+                db.rollback()
+                _result["error"] = (
+                    "Image pair is no longer pending; "
+                    "acquisition worker was not allowed to claim it."
+                )
+                return
+
+            db.commit()
 
             def update_progress(message: str) -> None:
                 _write_progress(pair_id, message, state="fetching")
@@ -357,9 +379,28 @@ def _do_fetch(
             if result.get("nx") is not None:
                 pair.nx = int(result["nx"])
 
-            pair.status        = "done"
-            pair.error_message = None
-            pair.fetched_at    = datetime.now(timezone.utc)
+            fetched_at = datetime.now(timezone.utc)
+
+            rows_updated = db.query(AOIImagePair).filter(
+                AOIImagePair.id == pair_id,
+                AOIImagePair.status == "fetching"
+            ).update({
+                "t1_start": pair.t1_start,
+                "t1_end": pair.t1_end,
+                "t2_start": pair.t2_start,
+                "t2_end": pair.t2_end,
+                "patch_px": pair.patch_px,
+                "resolution_m": pair.resolution_m,
+                "ground_m": pair.ground_m,
+                "nx": pair.nx,
+                "status": "done",
+                "error_message": None,
+                "fetched_at": fetched_at
+            })
+
+            if rows_updated == 0:
+                db.rollback()
+                return
 
             db.commit()
 
@@ -411,13 +452,10 @@ def trigger_fetch(aoi_id: str):
     Starts the GEE acquisition for the requested AOI.
 
     Guards:
-    1. Early geographic zone validation — rejects AOIs outside supported
-       research zones before any GEE call, avoiding the fetching-forever trap.
-    2. Duplicate-fetch prevention — if a pair is already fetching, return it.
-    3. Stale-fetch recovery — pairs stuck in 'fetching' for > _STALE_FETCH_MINUTES
+    1. Duplicate-fetch prevention — if a pair is already fetching, return it.
+    2. Stale-fetch recovery — pairs stuck in 'fetching' for > _STALE_FETCH_MINUTES
        are automatically reset to 'error' so the user can retry.
     """
-    from services.model_registry import is_location_in_supported_zone
 
     db = SessionLocal()
 
@@ -472,25 +510,6 @@ def trigger_fetch(aoi_id: str):
         lat = float(first_coordinate[0])
         lon = float(first_coordinate[1])
 
-        # ------------------------------------------------------------------
-        # GUARD 1 — Early geographic zone validation
-        # Reject AOIs outside the three established research zones BEFORE
-        # creating a pair record or spawning a GEE thread.  This prevents the
-        # "status = fetching forever" trap caused by a silent background crash.
-        # ------------------------------------------------------------------
-
-        in_zone, zone_name = is_location_in_supported_zone(lat, lon, "geonexus_p4b_k30")
-        if not in_zone:
-            supported = "Pune (18.3–18.8°N, 73.7–74.2°E), Satara (17.5–18.0°N, 73.5–74.0°E), Vidarbha (20.9–21.3°N, 78.9–79.3°E)"
-            return jsonify({
-                "error": (
-                    f"AOI at ({lat:.5f}°N, {lon:.5f}°E) is outside the supported "
-                    f"Geo-Nexus K30 research acquisition zones. "
-                    f"Supported zones: {supported}"
-                ),
-                "status": "error",
-                "supported_zones": ["pune", "satara", "vidarbha"],
-            }), 422
 
         # ------------------------------------------------------------------
         # GUARD 2 — Duplicate-fetch prevention
