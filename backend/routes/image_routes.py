@@ -52,6 +52,10 @@ image_bp.route("/api/images/<pair_id>/acquisition", methods=["GET"])(
 # Model analysis
 # ---------------------------------------------------------------------------
 
+image_bp.route("/api/images/<pair_id>/analyze", methods=["POST"])(
+    image_controller.run_pair_analysis
+)
+
 image_bp.route("/api/images/<pair_id>/analysis", methods=["GET"])(
     image_controller.get_pair_analysis
 )

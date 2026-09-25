@@ -1,173 +1,141 @@
+"""
+GeoWatch-Nexus model registry.
+
+The registry records the frozen runtime contract for the production K30 model.
+It does not load the checkpoint itself.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any
 
 
-BACKEND_ROOT = Path(__file__).resolve().parents[1]
-MODEL_DIR = BACKEND_ROOT / "models" / "geonexus_v3_2_k30"
-
-MODEL_REGISTRY = {
+MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     "geonexus_p4b_k30": {
         "name": "Geo-Nexus P4b Few-Shot K30",
         "version": "Geo-Nexus-v3.2-P4b-K30",
-
         "task": "binary_change_detection",
-
-        "checkpoint": str(
-            MODEL_DIR / "mh_fewshot_best_k30.pth"
-        ),
-
-        "model_source": str(
-            MODEL_DIR / "p3_geonexus_model.py"
-        ),
-
-        "normalization_file": str(
-            MODEL_DIR / "norm_stats_trainonly.json"
-        ),
-
         "input_channels": 17,
         "output_channels": 1,
-
         "patch_size": 128,
         "resolution_m": 10,
         "inference_stride": 128,
-
         "classes": {
-            "0": "no_change",
-            "1": "change",
+            0: "no_change",
+            1: "change",
         },
-
         "channel_order": [
-            "B2",
-            "B3",
-            "B4",
-            "B5",
-            "B6",
-            "B7",
-            "B8",
-            "B8A",
-            "B9",
-            "B11",
-            "B12",
-            "NDVI",
-            "NDBI",
-            "VV",
-            "VH",
-            "VH_VV",
+            "B2", "B3", "B4", "B5", "B6", "B7", "B8",
+            "B8A", "B9", "B11", "B12",
+            "NDVI", "NDBI",
+            "VV", "VH", "VH_VV",
             "Q",
         ],
-
         "s2_bands": [
-            "B2",
-            "B3",
-            "B4",
-            "B5",
-            "B6",
-            "B7",
-            "B8",
-            "B8A",
-            "B9",
-            "B11",
-            "B12",
+            "B2", "B3", "B4", "B5", "B6", "B7", "B8",
+            "B8A", "B9", "B11", "B12",
         ],
-
-        "derived_channels": [
-            "NDVI",
-            "NDBI",
-        ],
-
-        "sar_channels": [
-            "VV",
-            "VH",
-            "VH_VV",
-        ],
-
+        "derived_channels": ["NDVI", "NDBI"],
+        "sar_channels": ["VV", "VH", "VH_VV"],
         "quality_channel": "Q",
-
+        "cloud_score_collection": "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED",
+        "cloud_score_band": "cs_cdf",
         "cloud_score_threshold": 0.60,
-        "q_target": 8.0,
-
-        "default_threshold": 0.28,
-        "threshold_source": "MH-VAL",
-        "threshold_selection_policy": "validation_only",
-
-        "storage_contract": {
-            "s2_scale": 10000,
-            "s2_dtype": "int16",
-            "sar_scale": 100,
-            "sar_dtype": "int16",
-            "quality_dtype": "uint8",
-        },
-
+        "q_target_clear_observations": 8.0,
+        "s2_scale_storage": 10000,
+        "sar_db_scale_storage": 100,
+        "normalization_file": "norm_stats_trainonly.json",
+        "preprocessing_version": "Geo-Nexus-v3.2-17ch-runtime-v1",
         "temporal_protocol": {
-            "t1_start": "2020-01-01",
-            "t1_end": "2020-04-01",
-            "t2_start": "2024-01-01",
-            "t2_end": "2024-04-01",
+            "mode": "research",
+            "t1": ["2020-01-01", "2020-04-01"],
+            "t2": ["2024-01-01", "2024-04-01"],
         },
-
         "sar_protocol": {
+            "collection": "COPERNICUS/S1_GRD",
             "instrument_mode": "IW",
-            "polarizations": ["VV", "VH"],
-            "orbit_pass": "DESCENDING",
-            "common_relative_orbit": True,
-            "median_space": "linear_power",
+            "pass": "DESCENDING",
+            "require_common_relative_orbit": True,
             "low_look_threshold": 5,
             "low_look_filter": {
-                "radius": 1.5,
-                "shape": "circle",
-                "units": "pixels",
+                "function": "focal_median",
+                "radius_pixels": 1.5,
+                "kernel": "circle",
             },
+            "median_domain": "linear_power",
         },
-
-        "preferred_zone_orbits": {
-            "Pune": 136,
-            "Satara": 136,
-            "Vidarbha": 165,
+        "research_zone_orbits": [
+            {
+                "name": "pune",
+                "bbox": [73.70, 18.30, 74.20, 18.80],
+                "relative_orbit": 136,
+            },
+            {
+                "name": "satara",
+                "bbox": [73.50, 17.50, 74.00, 18.00],
+                "relative_orbit": 136,
+            },
+            {
+                "name": "vidarbha",
+                "bbox": [78.90, 20.90, 79.30, 21.30],
+                "relative_orbit": 165,
+            },
+        ],
+        "checkpoint": {
+            "filename": "mh_fewshot_best_k30.pth",
+            "path": "geonexus_v3_2_k30/mh_fewshot_best_k30.pth",
+            "sha256": "24C041635B7930D1A7794F11E0CC7C4EB6F61A0BB99018E14FC8C61AAA5415D3",
+            "required": True,
         },
-
-        "required_for_acquisition": False,
-        "required_for_inference": True,
+        "decision_threshold": {
+            "value": 0.28,
+            "source": "MH-VAL",
+            "metric": "F1",
+            "is_test_tuned": False,
+        },
     }
 }
 
 
-def get_model_config(model_id: str) -> dict:
-    config = MODEL_REGISTRY.get(model_id)
-
-    if config is None:
-        raise KeyError(f"Unknown model_id: {model_id}")
-
-    return config
+def get_model_config(model_id: str) -> dict[str, Any]:
+    try:
+        return MODEL_REGISTRY[model_id]
+    except KeyError as exc:
+        raise KeyError(f"Unknown model_id: {model_id}") from exc
 
 
-def checkpoint_available(model_id: str) -> bool:
-    checkpoint = Path(
-        get_model_config(model_id)["checkpoint"]
-    )
-    return checkpoint.is_file()
-
-
-def validate_model_contract(model_id: str = "geonexus_p4b_k30") -> None:
-    config = get_model_config(model_id)
-
-    assert config["input_channels"] == 17
-    assert config["patch_size"] == 128
-    assert config["resolution_m"] == 10
-    assert config["inference_stride"] == 128
-    assert config["cloud_score_threshold"] == 0.60
-    assert config["q_target"] == 8.0
-    assert config["default_threshold"] == 0.28
-
-    expected_channels = [
-        "B2", "B3", "B4", "B5", "B6", "B7",
-        "B8", "B8A", "B9", "B11", "B12",
-        "NDVI", "NDBI",
-        "VV", "VH", "VH_VV",
-        "Q",
-    ]
-
-    assert config["channel_order"] == expected_channels
-
-    if not checkpoint_available(model_id):
-        raise FileNotFoundError(
-            f"K30 checkpoint not found: {config['checkpoint']}"
+def list_models() -> list[dict[str, Any]]:
+    result = []
+    for model_id, config in MODEL_REGISTRY.items():
+        checkpoint = config["checkpoint"]
+        result.append(
+            {
+                "model_id": model_id,
+                "name": config["name"],
+                "version": config["version"],
+                "task": config["task"],
+                "input_channels": config["input_channels"],
+                "patch_size": config["patch_size"],
+                "resolution_m": config["resolution_m"],
+                "checkpoint_configured": bool(checkpoint.get("path")),
+            }
         )
+    return result
+
+
+def resolve_checkpoint_path(model_id: str, model_root: str | Path) -> Path | None:
+    """Return the checkpoint path when configured; otherwise None."""
+    config = get_model_config(model_id)
+    checkpoint = config["checkpoint"]
+    path = checkpoint.get("path")
+    if not path:
+        return None
+
+    resolved = Path(model_root) / path
+    return resolved
+
+
+def checkpoint_available(model_id: str, model_root: str | Path) -> bool:
+    path = resolve_checkpoint_path(model_id, model_root)
+    return path is not None and path.is_file()

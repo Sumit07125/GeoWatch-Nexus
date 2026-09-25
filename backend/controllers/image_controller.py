@@ -745,6 +745,63 @@ def get_pair_acquisition(pair_id: str):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/images/<pair_id>/analyze
+# ---------------------------------------------------------------------------
+
+def run_pair_analysis(pair_id: str):
+    """
+    Run the K30 binary inference and the spectral change-typing stage.
+
+    This endpoint is deliberately POST because inference writes generated
+    artifacts (analysis.json, masks, probability arrays) to disk.
+    """
+    db = SessionLocal()
+
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+        if not pair:
+            return jsonify({
+                "error": "Image pair not found"
+            }), 404
+
+        if pair.status != "done":
+            return jsonify({
+                "error": "Image acquisition is not complete",
+                "status": pair.status,
+                "message": "Wait until the satellite image pair has status=done."
+            }), 409
+    finally:
+        db.close()
+
+    try:
+        from services.inference_service import analyze_pair
+
+        # Keep the existing progress file separate from the canonical DB status.
+        try:
+            data_dir = _pair_data_dir(pair_id)
+            _write_progress(pair_id, "Starting model inference...", state="analyzing")
+        except Exception:
+            pass
+
+        result = analyze_pair(
+            pair_id,
+            progress_callback=lambda message: _write_progress(
+                pair_id, message, state="analyzing"
+            ),
+        )
+
+        return jsonify(result), 200
+
+    except Exception as exc:
+        _write_progress(pair_id, str(exc), state="analysis_error")
+        return jsonify({
+            "error": "Model analysis failed",
+            "message": str(exc),
+            "pair_id": pair_id,
+        }), 500
+
+
+# ---------------------------------------------------------------------------
 # GET /api/images/<pair_id>/analysis
 # ---------------------------------------------------------------------------
 
