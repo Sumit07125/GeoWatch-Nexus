@@ -123,3 +123,37 @@ export async function forwardGeocode(query) {
   return response.data;
 }
 
+/**
+ * Trigger a GEE satellite image fetch for an AOI.
+ * Runs asynchronously in the backend — poll /images to see when done.
+ * @param {string} aoiId
+ * @returns {Promise<Object>} { message, pair: { id, status, ... } }
+ */
+export async function triggerImageFetch(aoiId) {
+  const response = await API.post(`/aoi/${aoiId}/fetch-images`, {});
+  return response.data;
+}
+
+/**
+ * List all image pairs (before/after) for an AOI.
+ * @param {string} aoiId
+ * @returns {Promise<Object>} { pairs: [...], count }
+ */
+export async function fetchImagePairs(aoiId) {
+  const response = await API.get(`/aoi/${aoiId}/images`);
+  return response.data;
+}
+
+/**
+ * URL to serve the before-image PNG for a pair.
+ */
+export function beforeImageUrl(pairId) {
+  return `${API_BASE}/images/${pairId}/before`;
+}
+
+/**
+ * URL to serve the after-image PNG for a pair.
+ */
+export function afterImageUrl(pairId) {
+  return `${API_BASE}/images/${pairId}/after`;
+}

@@ -1,7 +1,7 @@
 import uuid
 import json
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Float, DateTime, Text, ForeignKey, LargeBinary, UniqueConstraint
+from sqlalchemy import Column, String, Float, DateTime, Text, ForeignKey, LargeBinary, Integer
 from sqlalchemy.orm import relationship
 from models.database import Base
 
@@ -18,6 +18,9 @@ class AOI(Base):
     status = Column(String(50), default="stopped")
     start_time = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    image_pairs = relationship("AOIImagePair", back_populates="aoi",
+                               cascade="all, delete-orphan")
 
     @property
     def coordinates(self):
@@ -47,51 +50,69 @@ class AOI(Base):
             "status": self.status,
             "start_time": self.start_time.isoformat() if self.start_time else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "has_images": bool(self.image_pairs),
         }
 
-class AOIImage(Base):
-    __tablename__ = "aoi_images"
-    __table_args__ = (UniqueConstraint('aoi_id', 'date', name='uq_aoi_date'),)
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    aoi_id = Column(String(36), ForeignKey('aois.id', ondelete='CASCADE'), nullable=False)
-    date = Column(String(20), nullable=False)
-    rgb_image = Column(LargeBinary(length=(2**32)-1), nullable=False)
-    index_image = Column(LargeBinary(length=(2**32)-1), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+class AOIImagePair(Base):
+    """
+    Stores one before/after satellite image pair for an AOI.
 
-class AOIAnalysis(Base):
-    __tablename__ = "aoi_analysis"
-    __table_args__ = (UniqueConstraint('aoi_id', 'from_date', 'to_date', name='uq_aoi_analysis'),)
+    Spec (FINAL_ARCH_3.md §2.1 / §D2):
+      Resolution : 10 m/pixel
+      Patch size : 128 × 128 px per tile
+      Ground     : 1,280 m × 1,280 m per tile = 1.6384 km²
+      Stored ch  : 14  (11 S2-optical + 2 S1-SAR + 1 n_clear quality)
+      Model ch   : 17  (+ NDVI, NDBI, cross-pol ratio derived on GPU)
+    """
+    __tablename__ = "aoi_image_pairs"
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    aoi_id = Column(String(36), ForeignKey('aois.id', ondelete='CASCADE'), nullable=False)
-    from_date = Column(String(20), nullable=False)
-    to_date = Column(String(20), nullable=False)
-    percentage_changed = Column(Float, nullable=False)
-    area_km2 = Column(Float, nullable=False)
-    recovery_area_km2 = Column(Float, nullable=True)
-    mean_index = Column(Float, nullable=True)
-    dense_percent = Column(Float, nullable=True)
-    sparse_percent = Column(Float, nullable=True)
-    barren_percent = Column(Float, nullable=True)
-    mask_image = Column(LargeBinary(length=(2**32)-1), nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    id            = Column(String(36), primary_key=True,
+                           default=lambda: str(uuid.uuid4()))
+    aoi_id        = Column(String(36), ForeignKey("aois.id", ondelete="CASCADE"),
+                           nullable=False)
 
-    aoi = relationship("AOI", backref="analyses")
-    
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "aoi_id": self.aoi_id,
-            "from_date": self.from_date,
-            "to_date": self.to_date,
-            "percentage_changed": self.percentage_changed,
-            "area_km2": self.area_km2,
-            "recovery_area_km2": self.recovery_area_km2,
-            "mean_index": self.mean_index,
-            "dense_percent": self.dense_percent,
-            "sparse_percent": self.sparse_percent,
-            "barren_percent": self.barren_percent,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+    # Image data — stored as PNG bytes for preview display
+    before_png    = Column(LargeBinary(length=(2**32) - 1), nullable=True)
+    after_png     = Column(LargeBinary(length=(2**32) - 1), nullable=True)
+
+    # Date windows used for each composite
+    before_date   = Column(String(20), nullable=True)   # end date of T1 window
+    after_date    = Column(String(20), nullable=True)   # end date of T2 window
+    t1_start      = Column(String(20), nullable=True)
+    t1_end        = Column(String(20), nullable=True)
+    t2_start      = Column(String(20), nullable=True)
+    t2_end        = Column(String(20), nullable=True)
+
+    # Tile grid metadata
+    nx            = Column(Integer, default=1)          # cover-area multiplier (1-5)
+    patch_px      = Column(Integer, default=128)
+    resolution_m  = Column(Integer, default=10)
+    ground_m      = Column(Float, default=1280.0)       # per tile side in metres
+
+    # Fetch status
+    status        = Column(String(20), default="pending")  # pending | fetching | done | error
+    error_message = Column(Text, nullable=True)
+    fetched_at    = Column(DateTime, nullable=True)
+    created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    aoi = relationship("AOI", back_populates="image_pairs")
+
+    def to_dict(self, include_images: bool = False):
+        d = {
+            "id":           self.id,
+            "aoi_id":       self.aoi_id,
+            "before_date":  self.before_date,
+            "after_date":   self.after_date,
+            "t1_window":    [self.t1_start, self.t1_end],
+            "t2_window":    [self.t2_start, self.t2_end],
+            "nx":           self.nx,
+            "patch_px":     self.patch_px,
+            "resolution_m": self.resolution_m,
+            "ground_m":     self.ground_m,
+            "status":       self.status,
+            "error":        self.error_message,
+            "fetched_at":   self.fetched_at.isoformat() if self.fetched_at else None,
+            "created_at":   self.created_at.isoformat() if self.created_at else None,
         }
+        return d

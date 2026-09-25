@@ -11,14 +11,17 @@ export default function AOIPanel({
 }) {
   const [aoiName, setAoiName] = useState("");
   const [description, setDescription] = useState("");
+  const [beforeDate, setBeforeDate] = useState("");
+  const [afterDate, setAfterDate] = useState("");
+  const [coverArea, setCoverArea] = useState("1");
 
   const handleLatChange = (e) => onLocationChange("latitude", parseFloat(e.target.value));
   const handleLonChange = (e) => onLocationChange("longitude", parseFloat(e.target.value));
 
   const handleSave = useCallback(() => {
     if (!latitude || !longitude) return;
-    onSave({ name: aoiName, description });
-  }, [latitude, longitude, aoiName, description, onSave]);
+    onSave({ name: aoiName, description, beforeDate, afterDate, coverArea });
+  }, [latitude, longitude, aoiName, description, beforeDate, afterDate, coverArea, onSave]);
 
   return (
     <aside className="aoi-panel">
@@ -118,6 +121,57 @@ export default function AOIPanel({
           </div>
         </div>
 
+        <div style={{ display: 'flex', gap: '16px', alignItems: 'center', marginBottom: '24px' }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <label htmlFor="before-date" style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-dark)', minWidth: '75px', margin: 0 }}>
+                Before Date
+              </label>
+              <input
+                id="before-date"
+                className="form-field__input"
+                type="date"
+                value={beforeDate}
+                onChange={(e) => setBeforeDate(e.target.value)}
+                style={{ flex: 1, padding: '8px', margin: 0 }}
+              />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <label htmlFor="after-date" style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-dark)', minWidth: '75px', margin: 0 }}>
+                After Date
+              </label>
+              <input
+                id="after-date"
+                className="form-field__input"
+                type="date"
+                value={afterDate}
+                onChange={(e) => setAfterDate(e.target.value)}
+                style={{ flex: 1, padding: '8px', margin: 0 }}
+              />
+            </div>
+            <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+              Leave blank to default to K30 strict research windows (2020 vs 2024).
+            </div>
+          </div>
+          
+          <div style={{ width: '180px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
+            <label htmlFor="cover-area" style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-dark)', margin: 0 }}>
+              Analysis Tiles (Model Grid)
+            </label>
+            <select
+              id="cover-area"
+              className="form-field__input"
+              value={coverArea}
+              onChange={(e) => setCoverArea(e.target.value)}
+              style={{ appearance: "auto", cursor: "pointer", width: '100%', padding: '8px 4px', textAlign: 'center' }}
+            >
+              <option value="1">1 model tile (1.28 × 1.28 km)</option>
+              <option value="2">2 × 2 tiles (2.56 × 2.56 km)</option>
+              <option value="4">4 × 4 tiles (5.12 × 5.12 km)</option>
+            </select>
+          </div>
+        </div>
+
         {/* ── Common: Name, Description, Save ──────────────── */}
         <div className="form-field">
           <label className="form-field__label" htmlFor="aoi-name">
@@ -146,6 +200,7 @@ export default function AOIPanel({
             rows={2}
           />
         </div>
+
 
         <button
           className="btn-save"

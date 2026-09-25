@@ -10,11 +10,10 @@ import os
 from dotenv import load_dotenv
 from flask import Flask
 from flask_cors import CORS
-from services.scheduler import start_scheduler
 from routes.aoi_routes import aoi_bp
-from routes.analysis_routes import analysis_bp
+from routes.image_routes import image_bp
 from models.database import engine, Base
-import models.aoi  # Import models to ensure they are registered with Base
+import models.aoi  # registers AOI + AOIImagePair with Base
 
 # Create tables if they don't exist
 Base.metadata.create_all(bind=engine)
@@ -32,25 +31,17 @@ def create_app():
 
     # ── Register Blueprints ───────────────────────────────────────
     app.register_blueprint(aoi_bp)
-    app.register_blueprint(analysis_bp)
+    app.register_blueprint(image_bp)
 
     # ── Health-check & Logs endpoint ──────────────────────────────
     @app.route("/api/health")
     def health():
         return {"status": "ok", "service": "EarthSentry API"}
-        
-    @app.route("/api/logs")
-    def get_system_logs():
-        from services.logger_service import get_logs
-        return {"logs": get_logs()}
 
     return app
 
 
 if __name__ == "__main__":
-    # Start the background tracking scheduler
-    start_scheduler()
-
     app = create_app()
     port = int(os.getenv("FLASK_PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "True").lower() == "true"

@@ -101,7 +101,7 @@ export default function AOIPage() {
   };
 
   const handleSave = useCallback(
-    async ({ name, description }) => {
+    async ({ name, description, beforeDate, afterDate, coverArea }) => {
       setIsSaving(true);
       try {
         await saveAOI({
@@ -109,6 +109,7 @@ export default function AOIPage() {
           description,
           shape_type: "point",
           coordinates: [[latitude, longitude]],
+          settings: { before_date: beforeDate, after_date: afterDate, cover_area: coverArea }
         });
         showToast("success", "Project coordinates saved successfully!");
       } catch (err) {
