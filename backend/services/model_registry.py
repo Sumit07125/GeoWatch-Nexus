@@ -136,6 +136,54 @@ def resolve_checkpoint_path(model_id: str, model_root: str | Path) -> Path | Non
     return resolved
 
 
+def validate_model_contract(model_id: str) -> None:
+    """
+    Validate that the model registry entry is internally consistent.
+
+    Called by gee_service before acquisition to ensure the runtime
+    contract has not been silently broken.
+
+    Raises ValueError on contract violation.
+    """
+    config = get_model_config(model_id)  # raises KeyError if unknown
+
+    required_keys = [
+        "input_channels",
+        "patch_size",
+        "resolution_m",
+        "channel_order",
+        "decision_threshold",
+        "temporal_protocol",
+    ]
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(
+                f"Model registry entry for '{model_id}' is missing required key: '{key}'"
+            )
+
+    if len(config["channel_order"]) != config["input_channels"]:
+        raise ValueError(
+            f"Model '{model_id}' declares {config['input_channels']} input_channels "
+            f"but channel_order has {len(config['channel_order'])} entries."
+        )
+
+
+def is_location_in_supported_zone(lat: float, lon: float, model_id: str) -> tuple[bool, str | None]:
+    """
+    Return (True, zone_name) if (lat, lon) falls inside a research_zone_orbit bbox,
+    or (False, None) if the location is outside all registered research zones.
+
+    Used for early validation before triggering expensive GEE calls.
+    """
+    config = get_model_config(model_id)
+    zones = config.get("research_zone_orbits", [])
+    for zone in zones:
+        min_lon, min_lat, max_lon, max_lat = zone["bbox"]
+        if min_lon <= lon <= max_lon and min_lat <= lat <= max_lat:
+            return True, zone["name"]
+    return False, None
+
+
 def checkpoint_available(model_id: str, model_root: str | Path) -> bool:
     path = resolve_checkpoint_path(model_id, model_root)
     return path is not None and path.is_file()

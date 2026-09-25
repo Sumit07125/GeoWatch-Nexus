@@ -217,8 +217,35 @@ def _write_json_artifact(pair_id: str, filename: str, payload: dict[str, Any]) -
 
 
 # ---------------------------------------------------------------------------
-# Background fetch worker
+# Background fetch worker helpers
 # ---------------------------------------------------------------------------
+
+_FETCH_TIMEOUT_SECONDS = 900  # 15 minutes hard wall-clock limit
+_STALE_FETCH_MINUTES  = 20    # mark as error if stuck in 'fetching' longer than this
+
+
+def _mark_pair_error(pair_id: str, message: str) -> None:
+    """
+    Mark a pair as 'error' using a fresh, independent DB session.
+
+    Called from the except block of _do_fetch so that a dirty/expired
+    main session cannot prevent the error state from being persisted.
+    """
+    db2 = SessionLocal()
+    try:
+        pair = db2.get(AOIImagePair, pair_id)
+        if pair:
+            pair.status = "error"
+            pair.error_message = str(message)[:1000]
+            db2.commit()
+    except Exception:
+        db2.rollback()
+    finally:
+        db2.close()
+
+    _write_progress(pair_id, str(message), state="error")
+
+
 
 def _do_fetch(
     pair_id: str,
@@ -237,181 +264,140 @@ def _do_fetch(
     - before_date / after_date are retained as legacy display values.
     - The full AOI payload is passed when available so polygon/rectangle AOIs
       are handled correctly.
+    - A hard wall-clock timeout of _FETCH_TIMEOUT_SECONDS is enforced. If the
+      GEE call does not finish within that window the pair is marked 'error'.
     """
+    import threading as _threading
 
-    db = SessionLocal()
+    # Shared result container for the inner worker thread.
+    _result: dict[str, Any] = {}
 
-    try:
-        # ------------------------------------------------------------------
-        # Load pair
-        # ------------------------------------------------------------------
-
-        pair = db.get(AOIImagePair, pair_id)
-
-        if not pair:
-            return
-
-        # ------------------------------------------------------------------
-        # Progress callback
-        # ------------------------------------------------------------------
-
-        _update_pair_status(pair_id, "fetching")
-
-        def update_progress(message: str) -> None:
-            _write_progress(pair_id, message, state="fetching")
-
-        update_progress("Starting Fetch...")
-
-        # ------------------------------------------------------------------
-        # Import GEE service lazily
-        # ------------------------------------------------------------------
-
-        from services.gee_service import fetch_image_pair
-
-        # ------------------------------------------------------------------
-        # Fetch imagery
-        # ------------------------------------------------------------------
-
-        result = fetch_image_pair(
-            lat=lat,
-            lon=lon,
-            before_date=before_date,
-            after_date=after_date,
-            cover_area=cover_area,
-            pair_id=pair_id,
-            update_progress=update_progress,
-            aoi=aoi_payload,
-            temporal_mode="research",
-            model_id="geonexus_p4b_k30",
-        )
-
-        # Persist acquisition metadata for the API/UI. Earth Engine objects
-        # are intentionally excluded because they are not JSON serializable.
-        acquisition_metadata = {
-            "pair_id": pair_id,
-            "run_id": result.get("run_id"),
-            "model_id": "geonexus_p4b_k30",
-            "t1_window": result.get("t1_window"),
-            "t2_window": result.get("t2_window"),
-            "crs": result.get("crs"),
-            "nx": result.get("nx"),
-            "patch_px": result.get("patch_px"),
-            "resolution_m": result.get("resolution_m"),
-            "ground_m": result.get("tile_ground_m", result.get("ground_m")),
-            "selected_orbit": result.get("selected_orbit"),
-            "s2_bands": result.get("s2_bands"),
-            "s1_bands": result.get("s1_bands"),
-        }
-        _write_json_artifact(
-            pair_id,
-            ACQUISITION_FILENAME,
-            acquisition_metadata,
-        )
-
-        _write_progress(
-            pair_id,
-            "Satellite acquisition completed. Ready for model inference.",
-            state="acquired",
-        )
-
-        # ------------------------------------------------------------------
-        # Refresh the pair after GEE finishes
-        # ------------------------------------------------------------------
-
-        pair = db.get(AOIImagePair, pair_id)
-
-        if not pair:
-            return
-
-        # ------------------------------------------------------------------
-        # Research temporal windows
-        # ------------------------------------------------------------------
-
-        t1_window = result.get("t1_window")
-        t2_window = result.get("t2_window")
-
-        if t1_window and len(t1_window) == 2:
-            pair.t1_start = t1_window[0]
-            pair.t1_end = t1_window[1]
-
-        if t2_window and len(t2_window) == 2:
-            pair.t2_start = t2_window[0]
-            pair.t2_end = t2_window[1]
-
-        # ------------------------------------------------------------------
-        # Grid / model metadata
-        # ------------------------------------------------------------------
-
-        if result.get("patch_px") is not None:
-            pair.patch_px = int(result["patch_px"])
-
-        if result.get("resolution_m") is not None:
-            pair.resolution_m = int(result["resolution_m"])
-
-        # Current GeoWatch-Nexus GEE service uses tile_ground_m.
-        # Keep ground_m as a compatibility fallback.
-        ground_m = result.get(
-            "tile_ground_m",
-            result.get("ground_m", 1280.0),
-        )
-
-        if ground_m is not None:
-            pair.ground_m = float(ground_m)
-
-        if result.get("nx") is not None:
-            pair.nx = int(result["nx"])
-
-        # ------------------------------------------------------------------
-        # Mark success
-        # ------------------------------------------------------------------
-
-        pair.status = "done"
-
-        # Clear stale errors from previous failed attempts.
-        pair.error_message = None
-
-        pair.fetched_at = datetime.now(timezone.utc)
-
-        db.commit()
-
-        _write_progress(
-            pair_id,
-            "Satellite acquisition completed.",
-            state="done",
-        )
-
-    except Exception as exc:
-        # ------------------------------------------------------------------
-        # Failure
-        # ------------------------------------------------------------------
-
-        db.rollback()
-
+    def _run_acquisition() -> None:
+        db = SessionLocal()
         try:
             pair = db.get(AOIImagePair, pair_id)
+            if not pair:
+                _result["error"] = "Image pair record not found"
+                return
 
-            if pair:
-                pair.status = "error"
-                pair.error_message = str(exc)
+            _update_pair_status(pair_id, "fetching")
 
-                db.commit()
+            def update_progress(message: str) -> None:
+                _write_progress(pair_id, message, state="fetching")
+
+            update_progress("Initializing acquisition...")
+
+            # Lazy import — keep inside try so ImportError is caught and
+            # correctly transitions the pair to 'error' instead of silently
+            # leaving it in 'fetching'.
+            from services.gee_service import fetch_image_pair
+
+            update_progress("Checking Sentinel-2 / Sentinel-1 coverage...")
+
+            result = fetch_image_pair(
+                lat=lat,
+                lon=lon,
+                before_date=before_date,
+                after_date=after_date,
+                cover_area=cover_area,
+                pair_id=pair_id,
+                update_progress=update_progress,
+                aoi=aoi_payload,
+                temporal_mode="research",
+                model_id="geonexus_p4b_k30",
+            )
+
+            # Write acquisition metadata for the API / UI.
+            acquisition_metadata = {
+                "pair_id":       pair_id,
+                "run_id":        result.get("run_id"),
+                "model_id":      "geonexus_p4b_k30",
+                "t1_window":     result.get("t1_window"),
+                "t2_window":     result.get("t2_window"),
+                "crs":           result.get("crs"),
+                "nx":            result.get("nx"),
+                "patch_px":      result.get("patch_px"),
+                "resolution_m":  result.get("resolution_m"),
+                "ground_m":      result.get("tile_ground_m", result.get("ground_m")),
+                "selected_orbit": result.get("selected_orbit"),
+                "s2_bands":      result.get("s2_bands"),
+                "s1_bands":      result.get("s1_bands"),
+            }
+            _write_json_artifact(pair_id, ACQUISITION_FILENAME, acquisition_metadata)
+
+            update_progress("Writing metadata and finalizing...")
+
+            # Refresh the pair object (GEE calls took time).
+            pair = db.get(AOIImagePair, pair_id)
+            if not pair:
+                _result["error"] = "Image pair record disappeared during acquisition"
+                return
+
+            t1_window = result.get("t1_window")
+            t2_window = result.get("t2_window")
+
+            if t1_window and len(t1_window) == 2:
+                pair.t1_start = t1_window[0]
+                pair.t1_end   = t1_window[1]
+
+            if t2_window and len(t2_window) == 2:
+                pair.t2_start = t2_window[0]
+                pair.t2_end   = t2_window[1]
+
+            if result.get("patch_px") is not None:
+                pair.patch_px = int(result["patch_px"])
+
+            if result.get("resolution_m") is not None:
+                pair.resolution_m = int(result["resolution_m"])
+
+            ground_m = result.get("tile_ground_m", result.get("ground_m", 1280.0))
+            if ground_m is not None:
+                pair.ground_m = float(ground_m)
+
+            if result.get("nx") is not None:
+                pair.nx = int(result["nx"])
+
+            pair.status        = "done"
+            pair.error_message = None
+            pair.fetched_at    = datetime.now(timezone.utc)
+
+            db.commit()
 
             _write_progress(
                 pair_id,
-                str(exc),
-                state="error",
+                "Satellite acquisition completed.",
+                state="done",
             )
 
-        except Exception:
+            _result["ok"] = True
+
+        except Exception as exc:
             db.rollback()
-            _write_progress(
-                pair_id,
-                str(exc),
-                state="error",
-            )
+            _result["error"] = str(exc)
 
-    finally:
-        db.close()
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------------
+    # Run acquisition with a hard timeout
+    # ------------------------------------------------------------------
+    t = _threading.Thread(target=_run_acquisition, daemon=True, name=f"geowatch-inner-{pair_id}")
+    t.start()
+    t.join(timeout=_FETCH_TIMEOUT_SECONDS)
+
+    if t.is_alive():
+        # Thread is still running beyond timeout — mark error and return.
+        # The inner thread will eventually finish or be cleaned up by the daemon.
+        _mark_pair_error(
+            pair_id,
+            f"Satellite acquisition timed out after {_FETCH_TIMEOUT_SECONDS // 60} minutes.",
+        )
+        return
+
+    if "error" in _result:
+        _mark_pair_error(pair_id, _result["error"])
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +409,15 @@ def trigger_fetch(aoi_id: str):
     POST /api/aoi/<id>/fetch-images
 
     Starts the GEE acquisition for the requested AOI.
+
+    Guards:
+    1. Early geographic zone validation — rejects AOIs outside supported
+       research zones before any GEE call, avoiding the fetching-forever trap.
+    2. Duplicate-fetch prevention — if a pair is already fetching, return it.
+    3. Stale-fetch recovery — pairs stuck in 'fetching' for > _STALE_FETCH_MINUTES
+       are automatically reset to 'error' so the user can retry.
     """
+    from services.model_registry import is_location_in_supported_zone
 
     db = SessionLocal()
 
@@ -435,38 +429,27 @@ def trigger_fetch(aoi_id: str):
         aoi = db.get(AOI, aoi_id)
 
         if not aoi:
-            return jsonify({
-                "error": "AOI not found"
-            }), 404
+            return jsonify({"error": "AOI not found"}), 404
 
         # ------------------------------------------------------------------
         # AOI settings
         # ------------------------------------------------------------------
 
         settings = aoi.settings or {}
-
-        # Flask's request.json can be None.
         request_data = request.get_json(silent=True) or {}
 
-        # Legacy date fields.
         before_date = (
             settings.get("before_date")
             or request_data.get("before_date")
             or "K30_T1 (2020)"
         )
-
         after_date = (
             settings.get("after_date")
             or request_data.get("after_date")
             or "K30_T2 (2024)"
         )
 
-        # ------------------------------------------------------------------
-        # Cover area / analysis tiles
-        # ------------------------------------------------------------------
-
         cover_area = _normalise_cover_area(settings)
-
         nx = int(cover_area[:-1])
 
         # ------------------------------------------------------------------
@@ -476,24 +459,82 @@ def trigger_fetch(aoi_id: str):
         coordinates = aoi.coordinates
 
         if not coordinates:
-            return jsonify({
-                "error": "AOI has no coordinates"
-            }), 400
+            return jsonify({"error": "AOI has no coordinates"}), 400
 
         first_coordinate = coordinates[0]
 
         if not isinstance(first_coordinate, (list, tuple)):
-            return jsonify({
-                "error": "AOI coordinates are invalid"
-            }), 400
+            return jsonify({"error": "AOI coordinates are invalid"}), 400
 
         if len(first_coordinate) != 2:
-            return jsonify({
-                "error": "AOI coordinate must contain [lat, lon]"
-            }), 400
+            return jsonify({"error": "AOI coordinate must contain [lat, lon]"}), 400
 
         lat = float(first_coordinate[0])
         lon = float(first_coordinate[1])
+
+        # ------------------------------------------------------------------
+        # GUARD 1 — Early geographic zone validation
+        # Reject AOIs outside the three established research zones BEFORE
+        # creating a pair record or spawning a GEE thread.  This prevents the
+        # "status = fetching forever" trap caused by a silent background crash.
+        # ------------------------------------------------------------------
+
+        in_zone, zone_name = is_location_in_supported_zone(lat, lon, "geonexus_p4b_k30")
+        if not in_zone:
+            supported = "Pune (18.3–18.8°N, 73.7–74.2°E), Satara (17.5–18.0°N, 73.5–74.0°E), Vidarbha (20.9–21.3°N, 78.9–79.3°E)"
+            return jsonify({
+                "error": (
+                    f"AOI at ({lat:.5f}°N, {lon:.5f}°E) is outside the supported "
+                    f"Geo-Nexus K30 research acquisition zones. "
+                    f"Supported zones: {supported}"
+                ),
+                "status": "error",
+                "supported_zones": ["pune", "satara", "vidarbha"],
+            }), 422
+
+        # ------------------------------------------------------------------
+        # GUARD 2 — Duplicate-fetch prevention
+        # If the AOI already has a pair in 'fetching', return it rather than
+        # spawning a second competing GEE worker.
+        # GUARD 3 — Stale-fetch recovery
+        # If a pair has been stuck in 'fetching' for > _STALE_FETCH_MINUTES,
+        # reset it to 'error' so the user can retry cleanly.
+        # ------------------------------------------------------------------
+
+        existing_pairs = aoi.image_pairs or []
+        for ep in existing_pairs:
+            if ep.status == "fetching":
+                # Calculate age of the fetch attempt
+                stale = False
+                if ep.created_at:
+                    try:
+                        from datetime import timedelta
+                        age = datetime.now(timezone.utc) - ep.created_at.replace(tzinfo=timezone.utc)
+                        if age > timedelta(minutes=_STALE_FETCH_MINUTES):
+                            stale = True
+                    except Exception:
+                        pass
+
+                if stale:
+                    # Reset stale pair to error so a fresh fetch can proceed.
+                    ep.status = "error"
+                    ep.error_message = (
+                        f"Acquisition did not complete within {_STALE_FETCH_MINUTES} minutes "
+                        f"and was automatically marked as failed. Please retry."
+                    )
+                    db.commit()
+                    _write_progress(
+                        str(ep.id),
+                        ep.error_message,
+                        state="error",
+                    )
+                    break  # allow a new pair to be created below
+                else:
+                    # Active fetch in progress — return existing pair
+                    return jsonify({
+                        "message": "Acquisition already in progress for this AOI.",
+                        "pair": ep.to_dict(),
+                    }), 202
 
         # ------------------------------------------------------------------
         # Create image-pair record
@@ -516,18 +557,12 @@ def trigger_fetch(aoi_id: str):
         db.refresh(pair)
 
         pair_id = pair.id
-
         pair_dict = pair.to_dict()
-
-        # Full AOI is captured before the DB session closes.
         aoi_payload = _build_aoi_payload(aoi)
 
     except Exception as exc:
         db.rollback()
-
-        return jsonify({
-            "error": str(exc)
-        }), 500
+        return jsonify({"error": str(exc)}), 500
 
     finally:
         db.close()
@@ -557,6 +592,7 @@ def trigger_fetch(aoi_id: str):
         "message": "Image fetch started",
         "pair": pair_dict,
     }), 202
+
 
 
 # ---------------------------------------------------------------------------
@@ -933,3 +969,92 @@ def get_change_legend(pair_id: str):
         "pair_id": pair_id,
         "classes": CHANGE_LEGEND,
     }), 200
+
+
+# ---------------------------------------------------------------------------
+# GET /api/images/<pair_id>/binary-mask
+# ---------------------------------------------------------------------------
+
+def serve_binary_mask_png(pair_id: str):
+    """
+    GET /api/images/<pair_id>/binary-mask
+
+    Serve change_mask_binary.png — the K30 binary change detection output.
+    NO CHANGE = BLACK, CHANGE = WHITE.
+    """
+    return _serve_analysis_png(pair_id, "change_mask_binary.png")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/images/<pair_id>/threshold
+# ---------------------------------------------------------------------------
+
+def update_pair_threshold(pair_id: str):
+    """
+    POST /api/images/<pair_id>/threshold
+
+    Re-apply a decision threshold to the cached probability map.
+    Regenerates binary mask, change-type mask, T2 overlay, and statistics.
+    Does NOT rerun Earth Engine or model inference.
+
+    Request JSON:
+        { "threshold": 0.28 }         (normalized probability 0.01–1.00)
+        or
+        { "threshold_percent": 28 }   (integer 1–100, auto-divided by 100)
+
+    Returns:
+        Updated analysis JSON (same schema as /analyze).
+    """
+    db = SessionLocal()
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+        if not pair:
+            return jsonify({"error": "Image pair not found"}), 404
+    finally:
+        db.close()
+
+    request_data = request.get_json(silent=True) or {}
+
+    # Accept either "threshold" (float) or "threshold_percent" (int 1-100)
+    if "threshold" in request_data:
+        try:
+            threshold = float(request_data["threshold"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "threshold must be a number"}), 400
+    elif "threshold_percent" in request_data:
+        try:
+            pct = float(request_data["threshold_percent"])
+            threshold = pct / 100.0
+        except (TypeError, ValueError):
+            return jsonify({"error": "threshold_percent must be a number"}), 400
+    else:
+        return jsonify({"error": "Request must include 'threshold' or 'threshold_percent'"}), 400
+
+    # Independent backend validation — never trust frontend
+    if not (0.01 <= threshold <= 1.00):
+        return jsonify({
+            "error": f"threshold must be between 0.01 and 1.00 (inclusive). Got: {threshold:.4f}",
+            "valid_range": {"min": 0.01, "max": 1.00},
+        }), 400
+
+    # Check that the probability map exists (requires prior full analysis)
+    prob_path = os.path.join(_pair_data_dir(pair_id), "change_probability.npy")
+    if not os.path.isfile(prob_path):
+        return jsonify({
+            "error": "Probability map not found. Run Detection Mask first.",
+            "message": "POST /api/images/{pair_id}/analyze must be called before updating the threshold.",
+        }), 409
+
+    try:
+        from services.inference_service import apply_threshold
+        result = apply_threshold(pair_id, threshold)
+        return jsonify(result), 200
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({
+            "error": "Threshold update failed",
+            "message": str(exc),
+        }), 500

@@ -157,3 +157,96 @@ export function beforeImageUrl(pairId) {
 export function afterImageUrl(pairId) {
   return `${API_BASE}/images/${pairId}/after`;
 }
+
+/**
+ * URL to serve the multicolor change mask PNG.
+ */
+export function changeMaskUrl(pairId) {
+  return `${API_BASE}/images/${pairId}/mask`;
+}
+
+/**
+ * URL to serve the T2 + mask overlay PNG.
+ */
+export function t2MaskUrl(pairId) {
+  return `${API_BASE}/images/${pairId}/t2-mask`;
+}
+
+/**
+ * Fetch acquisition progress for an image pair.
+ * @param {string} pairId
+ * @returns {Promise<Object>} { pair_id, status, state, message }
+ */
+export async function fetchPairProgress(pairId) {
+  const response = await API.get(`/images/${pairId}/progress`);
+  return response.data;
+}
+
+/**
+ * Fetch acquisition metadata for an image pair.
+ * @param {string} pairId
+ * @returns {Promise<Object>}
+ */
+export async function fetchPairAcquisition(pairId) {
+  const response = await API.get(`/images/${pairId}/acquisition`);
+  return response.data;
+}
+
+/**
+ * Fetch the existing analysis JSON for an image pair.
+ * Returns null (404) if analysis has not been run yet.
+ * @param {string} pairId
+ * @returns {Promise<Object|null>}
+ */
+export async function fetchPairAnalysis(pairId) {
+  try {
+    const response = await API.get(`/images/${pairId}/analysis`);
+    return response.data;
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/**
+ * Trigger K30 model inference for an image pair.
+ * @param {string} pairId
+ * @returns {Promise<Object>}
+ */
+export async function runPairAnalysis(pairId) {
+  const response = await API.post(`/images/${pairId}/analyze`);
+  return response.data;
+}
+
+/**
+ * Fetch the change-type color legend for an image pair.
+ * @param {string} pairId
+ * @returns {Promise<Object>} { pair_id, classes: { "0": {...}, ... } }
+ */
+export async function fetchChangeLegend(pairId) {
+  const response = await API.get(`/images/${pairId}/legend`);
+  return response.data;
+}
+
+/**
+ * URL to serve the binary change mask PNG (black = no change, white = change).
+ */
+export function binaryMaskUrl(pairId) {
+  return `${API_BASE}/images/${pairId}/binary-mask`;
+}
+
+/**
+ * Re-apply a decision threshold to the cached probability map.
+ * Regenerates binary mask, change-type mask, overlay, and statistics.
+ * Does NOT rerun GEE or model inference.
+ *
+ * @param {string} pairId
+ * @param {number} threshold - normalized probability [0.01, 1.00]
+ * @returns {Promise<Object>} Updated analysis JSON
+ */
+export async function updatePairThreshold(pairId, threshold) {
+  const response = await API.post(`/images/${pairId}/threshold`, { threshold });
+  return response.data;
+}

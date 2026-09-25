@@ -76,3 +76,11 @@ image_bp.route("/api/images/<pair_id>/mask", methods=["GET"])(
 image_bp.route("/api/images/<pair_id>/t2-mask", methods=["GET"])(
     image_controller.serve_t2_mask_png
 )
+
+image_bp.route("/api/images/<pair_id>/binary-mask", methods=["GET"])(
+    image_controller.serve_binary_mask_png
+)
+
+image_bp.route("/api/images/<pair_id>/threshold", methods=["POST"])(
+    image_controller.update_pair_threshold
+)

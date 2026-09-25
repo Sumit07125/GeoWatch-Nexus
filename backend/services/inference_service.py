@@ -90,15 +90,16 @@ CLASS_NAMES = {
 
 # UI colors are fixed and must remain stable so the frontend legend never drifts.
 CLASS_COLORS = {
-    0: (128, 128, 128),      # gray
+    0: (0, 0, 0),            # black  — no change
     1: (21, 101, 192),       # blue
     2: (79, 195, 247),       # light blue
     3: (255, 152, 0),        # orange
     4: (229, 57, 53),        # red
     5: (67, 160, 71),        # green
     6: (142, 68, 173),       # purple
-    255: (189, 189, 189),    # light gray
+    255: (0, 0, 0),          # black  — uncertain rendered same as no-change
 }
+
 
 # Research change-typing thresholds taken from the project's evidence logic.
 TYPE_CFG = {
@@ -807,6 +808,136 @@ def analyze_pair(pair_id: str, *, progress_callback=None) -> dict[str, Any]:
 
     _atomic_json(pair_dir / "analysis.json", analysis)
     _write_progress(pair_dir, pair_id, "Model analysis completed.", "analysis_done")
+    return analysis
+
+
+def apply_threshold(pair_id: str, threshold: float) -> dict[str, Any]:
+    """
+    Re-apply a new decision threshold to the stored probability map.
+
+    Does NOT rerun the neural-network forward pass. Loads
+    change_probability.npy, applies the new threshold, regenerates
+    all downstream artifacts (binary mask, change-type mask, T2 overlay,
+    statistics), and writes updated analysis.json.
+
+    Parameters
+    ----------
+    pair_id   : UUID string of the image pair.
+    threshold : Probability threshold in [0.01, 1.00].
+
+    Returns
+    -------
+    Updated analysis dict (same schema as analyze_pair).
+    """
+    if not (0.01 <= threshold <= 1.00):
+        raise ValueError(f"threshold must be in [0.01, 1.00]; got {threshold}")
+
+    if pair_id in {".", ".."} or "/" in pair_id or "\\" in pair_id:
+        raise ValueError("Invalid pair_id")
+
+    pair_dir = BACKEND_ROOT / "data" / pair_id
+    prob_path = pair_dir / "change_probability.npy"
+    if not prob_path.is_file():
+        raise FileNotFoundError(
+            "change_probability.npy not found for this pair. "
+            "Run the full analysis first before changing the threshold."
+        )
+
+    # Load cached probability map
+    probability = np.load(prob_path).astype(np.float32)
+
+    # Load x1/x2 for spectral change typing (needed to reclassify)
+    opt1_raw = _read_stack(pair_dir, "before_optical", 12)
+    opt2_raw = _read_stack(pair_dir, "after_optical", 12)
+    sar1_raw = _read_stack(pair_dir, "before_sar", 2)
+    sar2_raw = _read_stack(pair_dir, "after_sar", 2)
+    x1, x2 = _derive_17_channels(opt1_raw, sar1_raw, opt2_raw, sar2_raw)
+
+    # Apply new threshold
+    binary = probability >= threshold
+    binary = _apply_binary_morphology(binary)
+
+    q = np.clip(x1[16], 0.0, 1.0)
+    low_q_percent = 100.0 * float((q < 0.25).mean())
+
+    labels = _change_typing(x1, x2, binary, q)
+
+    total_pixels = int(labels.size)
+    changed_pixels = int(np.isin(labels, [1, 2, 3, 4, 5, 6, 255]).sum())
+    class_stats = _class_statistics(labels, total_pixels)
+
+    # Ground truth (optional, recalculate at new threshold if available)
+    gt = _load_ground_truth(pair_dir, probability.shape)
+    if gt is None:
+        gt_metrics = {
+            "ground_truth_available": False,
+            "threshold": threshold,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "iou": None,
+            "accuracy": None,
+            "average_precision": None,
+        }
+    else:
+        gt_metrics = _binary_metrics(probability, gt, threshold)
+
+    # Static benchmark — always tied to the validated 0.28 research threshold
+    benchmark = {
+        "scope": "Geo-Nexus P4b K30 verified benchmark",
+        "threshold": 0.28,
+        "mh_val":  {"f1": 0.739389},
+        "mh_test": {
+            "f1": 0.636976,
+            "iou": 0.467325,
+            "average_precision": 0.699608,
+            "precision": None,
+            "recall": None,
+        },
+        "note": "Benchmark metrics are not ground-truth metrics for this arbitrary AOI.",
+    }
+
+    # Update downstream artifact files
+    np.save(pair_dir / "change_mask_binary.npy", binary.astype(np.uint8))
+    np.save(pair_dir / "change_type_mask.npy", labels.astype(np.uint8))
+    _save_binary_png(binary, pair_dir / "change_mask_binary.png")
+    _save_mask_png(labels, pair_dir / "change_mask.png")
+    _save_t2_overlay(pair_dir, labels, pair_dir / "t2_mask_overlay.png")
+
+    class_percent_total_change = 100.0 * changed_pixels / max(total_pixels, 1)
+
+    # Read current analysis.json for fields we don't recompute
+    analysis_path = pair_dir / "analysis.json"
+    existing: dict[str, Any] = {}
+    if analysis_path.is_file():
+        try:
+            with analysis_path.open("r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Rebuild analysis dict, patching only threshold-dependent fields
+    analysis = dict(existing)
+    analysis["pair_id"] = pair_id
+    analysis["status"] = "complete"
+    analysis["model"] = {
+        **existing.get("model", {}),
+        "threshold": threshold,
+        "threshold_source": "user" if threshold != THRESHOLD else "MH-VAL",
+    }
+    analysis["binary_detection"] = {
+        "changed_pixels_before_display_typing": int(binary.sum()),
+        "changed_area_m2_before_typing": int(binary.sum()) * 100,
+        "changed_area_km2_before_typing": float(binary.sum()) * 100 / 1_000_000,
+        "changed_percent_before_display_typing": 100.0 * float(binary.mean()),
+        "typed_or_uncertain_percent": class_percent_total_change,
+    }
+    analysis["class_statistics"] = class_stats
+    analysis["ground_truth_metrics"] = gt_metrics
+    analysis["model_benchmark"] = benchmark
+
+    _atomic_json(analysis_path, analysis)
+    _write_progress(pair_dir, pair_id, f"Threshold updated to {threshold:.2f}.", "analysis_done")
     return analysis
 
 
