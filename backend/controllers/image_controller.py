@@ -1,152 +1,878 @@
 """
-Image Controller
-=================
+GeoWatch-Nexus Image Controller
+================================
+
 Handles HTTP endpoints for triggering and serving satellite image pair fetches.
 
-POST /api/aoi/<id>/fetch-images   → kick off a GEE fetch (async thread)
-GET  /api/aoi/<id>/images         → list all image pairs for an AOI
-GET  /api/images/<pair_id>/before → serve the before PNG
-GET  /api/images/<pair_id>/after  → serve the after PNG
+POST /api/aoi/<id>/fetch-images
+    → start a GEE fetch
+
+GET /api/aoi/<id>/images
+    → list all image pairs for an AOI
+
+GET /api/images/<pair_id>/before
+    → serve the before RGB PNG
+
+GET /api/images/<pair_id>/after
+    → serve the after RGB PNG
+
+GET /api/images/<pair_id>/progress
+    → return acquisition progress without overwriting the DB status
+
+GET /api/images/<pair_id>/analysis
+    → return the inference/analysis summary JSON
+
+GET /api/images/<pair_id>/mask
+    → serve the multicolor change-type mask PNG
+
+GET /api/images/<pair_id>/t2-mask
+    → serve the change mask overlaid on the T2 image
+
+GET /api/images/<pair_id>/legend
+    → return the fixed change-type colour legend
 """
 
-import base64
+from __future__ import annotations
+
+import json
+import os
 import threading
 from datetime import datetime, timezone
+from typing import Any
 
-from flask import jsonify, request, Response
+from flask import jsonify, request, send_file
+
 from models.database import SessionLocal
 from models.aoi import AOI, AOIImagePair
 
 
-def _do_fetch(pair_id: str, lat: float, lon: float,
-              before_date: str, after_date: str, cover_area: str):
-    """Background thread: calls GEE, stores PNGs in DB."""
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_ROOT = os.path.join(BACKEND_ROOT, "data")
+
+PROGRESS_FILENAME = "progress.json"
+ACQUISITION_FILENAME = "acquisition.json"
+ANALYSIS_FILENAME = "analysis.json"
+
+# Fixed UI legend for the multicolor change-type mask.
+# The model checkpoint is binary change/no-change; these 7 display classes
+# are produced by the post-processing/change-typing stage.
+CHANGE_LEGEND = {
+    "0": {"name": "no_change", "label": "No change", "color": "#808080"},
+    "1": {"name": "water_gain", "label": "Water gain", "color": "#1565C0"},
+    "2": {"name": "water_loss", "label": "Water loss", "color": "#4FC3F7"},
+    "3": {"name": "construction", "label": "Construction", "color": "#FF9800"},
+    "4": {"name": "veg_loss", "label": "Vegetation loss", "color": "#E53935"},
+    "5": {"name": "veg_gain", "label": "Vegetation gain", "color": "#43A047"},
+    "6": {"name": "other", "label": "Other change", "color": "#8E44AD"},
+    "255": {"name": "uncertain", "label": "Uncertain", "color": "#BDBDBD"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalise_cover_area(settings: dict[str, Any]) -> str:
+    """
+    Return cover area in the canonical 'Nx' format.
+
+    Priority:
+        analysis_tiles
+        cover_area
+        1
+    """
+    raw = settings.get(
+        "analysis_tiles",
+        settings.get("cover_area", 1),
+    )
+
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value.endswith("x"):
+            value = value[:-1]
+
+        if not value.isdigit():
+            raise ValueError(
+                "analysis_tiles/cover_area must be an integer from 1 to 5"
+            )
+
+        nx = int(value)
+
+    elif isinstance(raw, int):
+        nx = raw
+
+    else:
+        raise ValueError(
+            "analysis_tiles/cover_area must be an integer from 1 to 5"
+        )
+
+    if not 1 <= nx <= 5:
+        raise ValueError(
+            "analysis_tiles/cover_area must be between 1 and 5"
+        )
+
+    return f"{nx}x"
+
+
+def _build_aoi_payload(aoi: AOI) -> dict[str, Any]:
+    """
+    Build the AOI payload expected by gee_service.fetch_image_pair().
+    """
+    return {
+        "id": aoi.id,
+        "name": aoi.name,
+        "description": aoi.description,
+        "shape_type": aoi.shape_type,
+        "coordinates": aoi.coordinates,
+        "settings": aoi.settings or {},
+    }
+
+
+def _update_pair_status(pair_id: str, status: str) -> None:
+    """
+    Update the canonical DB status field.
+
+    IMPORTANT:
+    status is never used for human-readable progress messages. Valid values
+    used by the controller are:
+        pending -> fetching -> done
+        pending/fetching -> error
+    """
+    if status not in {"pending", "fetching", "done", "error"}:
+        raise ValueError(
+            "Invalid image-pair status. Use pending, fetching, done, or error."
+        )
+
     db = SessionLocal()
+
     try:
         pair = db.get(AOIImagePair, pair_id)
+
+        if pair:
+            pair.status = status
+            db.commit()
+
+    except Exception:
+        db.rollback()
+
+    finally:
+        db.close()
+
+
+def _pair_data_dir(pair_id: str) -> str:
+    """
+    Return the backend-controlled directory for a pair.
+
+    pair_id is generated by the database as a UUID. Reject path separators
+    anyway so this helper is safe if called from a future non-DB entry point.
+    """
+    pair_id = str(pair_id)
+
+    if pair_id in {".", ".."} or "/" in pair_id or "\\" in pair_id:
+        raise ValueError("Invalid pair_id")
+
+    path = os.path.join(DATA_ROOT, pair_id)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _write_progress(pair_id: str, message: str, *, state: str = "fetching") -> None:
+    """
+    Persist user-facing progress separately from the DB status.
+
+    This fixes the previous bug where messages such as
+    'Creating RGB previews...' overwrote pair.status.
+    """
+    payload = {
+        "pair_id": pair_id,
+        "state": state,
+        "message": str(message),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        path = os.path.join(_pair_data_dir(pair_id), PROGRESS_FILENAME)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # Progress reporting must never break the acquisition worker.
+        pass
+
+
+def _write_json_artifact(pair_id: str, filename: str, payload: dict[str, Any]) -> None:
+    """Atomically write a backend-generated JSON artifact for the UI/API."""
+    path = os.path.join(_pair_data_dir(pair_id), filename)
+    tmp = f"{path}.tmp"
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Background fetch worker
+# ---------------------------------------------------------------------------
+
+def _do_fetch(
+    pair_id: str,
+    lat: float,
+    lon: float,
+    before_date: str,
+    after_date: str,
+    cover_area: str,
+    aoi_payload: dict[str, Any] | None = None,
+) -> None:
+    """
+    Execute the Earth Engine acquisition and update the image-pair record.
+
+    Notes:
+    - GEE research mode is authoritative.
+    - before_date / after_date are retained as legacy display values.
+    - The full AOI payload is passed when available so polygon/rectangle AOIs
+      are handled correctly.
+    """
+
+    db = SessionLocal()
+
+    try:
+        # ------------------------------------------------------------------
+        # Load pair
+        # ------------------------------------------------------------------
+
+        pair = db.get(AOIImagePair, pair_id)
+
         if not pair:
             return
 
-        def update_progress(msg: str):
-            # We open a new small session to update just the status string
-            # to avoid locking the main pair object for too long.
-            local_db = SessionLocal()
-            try:
-                local_pair = local_db.get(AOIImagePair, pair_id)
-                if local_pair:
-                    local_pair.status = msg
-                    local_db.commit()
-            finally:
-                local_db.close()
+        # ------------------------------------------------------------------
+        # Progress callback
+        # ------------------------------------------------------------------
+
+        _update_pair_status(pair_id, "fetching")
+
+        def update_progress(message: str) -> None:
+            _write_progress(pair_id, message, state="fetching")
 
         update_progress("Starting Fetch...")
 
+        # ------------------------------------------------------------------
+        # Import GEE service lazily
+        # ------------------------------------------------------------------
+
         from services.gee_service import fetch_image_pair
-        result = fetch_image_pair(lat, lon, before_date, after_date, cover_area, pair_id, update_progress)
+
+        # ------------------------------------------------------------------
+        # Fetch imagery
+        # ------------------------------------------------------------------
+
+        result = fetch_image_pair(
+            lat=lat,
+            lon=lon,
+            before_date=before_date,
+            after_date=after_date,
+            cover_area=cover_area,
+            pair_id=pair_id,
+            update_progress=update_progress,
+            aoi=aoi_payload,
+            temporal_mode="research",
+            model_id="geonexus_p4b_k30",
+        )
+
+        # Persist acquisition metadata for the API/UI. Earth Engine objects
+        # are intentionally excluded because they are not JSON serializable.
+        acquisition_metadata = {
+            "pair_id": pair_id,
+            "run_id": result.get("run_id"),
+            "model_id": "geonexus_p4b_k30",
+            "t1_window": result.get("t1_window"),
+            "t2_window": result.get("t2_window"),
+            "crs": result.get("crs"),
+            "nx": result.get("nx"),
+            "patch_px": result.get("patch_px"),
+            "resolution_m": result.get("resolution_m"),
+            "ground_m": result.get("tile_ground_m", result.get("ground_m")),
+            "selected_orbit": result.get("selected_orbit"),
+            "s2_bands": result.get("s2_bands"),
+            "s1_bands": result.get("s1_bands"),
+        }
+        _write_json_artifact(
+            pair_id,
+            ACQUISITION_FILENAME,
+            acquisition_metadata,
+        )
+
+        _write_progress(
+            pair_id,
+            "Satellite acquisition completed. Ready for model inference.",
+            state="acquired",
+        )
+
+        # ------------------------------------------------------------------
+        # Refresh the pair after GEE finishes
+        # ------------------------------------------------------------------
 
         pair = db.get(AOIImagePair, pair_id)
-        pair.t1_start     = result["t1_window"][0]
-        pair.t1_end       = result["t1_window"][1]
-        pair.t2_start     = result["t2_window"][0]
-        pair.t2_end       = result["t2_window"][1]
-        pair.patch_px     = result["patch_px"]
-        pair.resolution_m = result["resolution_m"]
-        pair.ground_m     = result["tile_ground_m"]
-        pair.status       = "done"
-        pair.fetched_at   = datetime.now(timezone.utc)
+
+        if not pair:
+            return
+
+        # ------------------------------------------------------------------
+        # Research temporal windows
+        # ------------------------------------------------------------------
+
+        t1_window = result.get("t1_window")
+        t2_window = result.get("t2_window")
+
+        if t1_window and len(t1_window) == 2:
+            pair.t1_start = t1_window[0]
+            pair.t1_end = t1_window[1]
+
+        if t2_window and len(t2_window) == 2:
+            pair.t2_start = t2_window[0]
+            pair.t2_end = t2_window[1]
+
+        # ------------------------------------------------------------------
+        # Grid / model metadata
+        # ------------------------------------------------------------------
+
+        if result.get("patch_px") is not None:
+            pair.patch_px = int(result["patch_px"])
+
+        if result.get("resolution_m") is not None:
+            pair.resolution_m = int(result["resolution_m"])
+
+        # Current GeoWatch-Nexus GEE service uses tile_ground_m.
+        # Keep ground_m as a compatibility fallback.
+        ground_m = result.get(
+            "tile_ground_m",
+            result.get("ground_m", 1280.0),
+        )
+
+        if ground_m is not None:
+            pair.ground_m = float(ground_m)
+
+        if result.get("nx") is not None:
+            pair.nx = int(result["nx"])
+
+        # ------------------------------------------------------------------
+        # Mark success
+        # ------------------------------------------------------------------
+
+        pair.status = "done"
+
+        # Clear stale errors from previous failed attempts.
+        pair.error_message = None
+
+        pair.fetched_at = datetime.now(timezone.utc)
+
         db.commit()
 
+        _write_progress(
+            pair_id,
+            "Satellite acquisition completed.",
+            state="done",
+        )
+
     except Exception as exc:
+        # ------------------------------------------------------------------
+        # Failure
+        # ------------------------------------------------------------------
+
         db.rollback()
+
         try:
             pair = db.get(AOIImagePair, pair_id)
+
             if pair:
                 pair.status = "error"
                 pair.error_message = str(exc)
+
                 db.commit()
+
+            _write_progress(
+                pair_id,
+                str(exc),
+                state="error",
+            )
+
         except Exception:
-            pass
+            db.rollback()
+            _write_progress(
+                pair_id,
+                str(exc),
+                state="error",
+            )
+
     finally:
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# POST /api/aoi/<id>/fetch-images
+# ---------------------------------------------------------------------------
+
 def trigger_fetch(aoi_id: str):
-    """POST /api/aoi/<id>/fetch-images"""
+    """
+    POST /api/aoi/<id>/fetch-images
+
+    Starts the GEE acquisition for the requested AOI.
+    """
+
     db = SessionLocal()
+
     try:
+        # ------------------------------------------------------------------
+        # Load AOI
+        # ------------------------------------------------------------------
+
         aoi = db.get(AOI, aoi_id)
+
         if not aoi:
-            return jsonify({"error": "AOI not found"}), 404
+            return jsonify({
+                "error": "AOI not found"
+            }), 404
 
-        settings    = aoi.settings or {}
-        before_date = settings.get("before_date") or request.json.get("before_date") if request.json else settings.get("before_date")
-        after_date  = settings.get("after_date")  or request.json.get("after_date")  if request.json else settings.get("after_date")
-        cover_area  = settings.get("cover_area", "1x")
+        # ------------------------------------------------------------------
+        # AOI settings
+        # ------------------------------------------------------------------
 
-        if not before_date or not after_date:
-            before_date = "K30_T1 (2020)"
-            after_date = "K30_T2 (2024)"
+        settings = aoi.settings or {}
 
-        lat = aoi.coordinates[0][0]
-        lon = aoi.coordinates[0][1]
-        
-        # Get nx from new analysis_tiles or old cover_area
-        nx_raw = settings.get("analysis_tiles", settings.get("cover_area", "1"))
-        nx_val = int(str(nx_raw).replace("x", ""))
+        # Flask's request.json can be None.
+        request_data = request.get_json(silent=True) or {}
 
-        # Create a pending image pair record
-        pair = AOIImagePair(
-            aoi_id      = aoi_id,
-            before_date = before_date,
-            after_date  = after_date,
-            nx          = nx_val,
-            status      = "pending",
+        # Legacy date fields.
+        before_date = (
+            settings.get("before_date")
+            or request_data.get("before_date")
+            or "K30_T1 (2020)"
         )
+
+        after_date = (
+            settings.get("after_date")
+            or request_data.get("after_date")
+            or "K30_T2 (2024)"
+        )
+
+        # ------------------------------------------------------------------
+        # Cover area / analysis tiles
+        # ------------------------------------------------------------------
+
+        cover_area = _normalise_cover_area(settings)
+
+        nx = int(cover_area[:-1])
+
+        # ------------------------------------------------------------------
+        # AOI coordinates
+        # ------------------------------------------------------------------
+
+        coordinates = aoi.coordinates
+
+        if not coordinates:
+            return jsonify({
+                "error": "AOI has no coordinates"
+            }), 400
+
+        first_coordinate = coordinates[0]
+
+        if not isinstance(first_coordinate, (list, tuple)):
+            return jsonify({
+                "error": "AOI coordinates are invalid"
+            }), 400
+
+        if len(first_coordinate) != 2:
+            return jsonify({
+                "error": "AOI coordinate must contain [lat, lon]"
+            }), 400
+
+        lat = float(first_coordinate[0])
+        lon = float(first_coordinate[1])
+
+        # ------------------------------------------------------------------
+        # Create image-pair record
+        # ------------------------------------------------------------------
+
+        pair = AOIImagePair(
+            aoi_id=aoi_id,
+            before_date=before_date,
+            after_date=after_date,
+            nx=nx,
+            patch_px=128,
+            resolution_m=10,
+            ground_m=1280.0,
+            status="pending",
+            error_message=None,
+        )
+
         db.add(pair)
         db.commit()
         db.refresh(pair)
+
         pair_id = pair.id
+
         pair_dict = pair.to_dict()
 
+        # Full AOI is captured before the DB session closes.
+        aoi_payload = _build_aoi_payload(aoi)
+
+    except Exception as exc:
+        db.rollback()
+
+        return jsonify({
+            "error": str(exc)
+        }), 500
+
     finally:
         db.close()
 
-    # Fire the GEE fetch in a background thread so the HTTP response returns immediately
-    t = threading.Thread(
+    # ----------------------------------------------------------------------
+    # Background worker
+    # ----------------------------------------------------------------------
+
+    worker = threading.Thread(
         target=_do_fetch,
-        args=(pair_id, lat, lon, before_date, after_date, cover_area),
+        kwargs={
+            "pair_id": pair_id,
+            "lat": lat,
+            "lon": lon,
+            "before_date": before_date,
+            "after_date": after_date,
+            "cover_area": cover_area,
+            "aoi_payload": aoi_payload,
+        },
         daemon=True,
+        name=f"geowatch-fetch-{pair_id}",
     )
-    t.start()
 
-    return jsonify({"message": "Image fetch started", "pair": pair_dict}), 202
+    worker.start()
 
+    return jsonify({
+        "message": "Image fetch started",
+        "pair": pair_dict,
+    }), 202
+
+
+# ---------------------------------------------------------------------------
+# GET /api/aoi/<id>/images
+# ---------------------------------------------------------------------------
 
 def get_image_pairs(aoi_id: str):
-    """GET /api/aoi/<id>/images"""
+    """
+    GET /api/aoi/<id>/images
+
+    Return all image-pair records associated with an AOI.
+    """
+
     db = SessionLocal()
+
     try:
         aoi = db.get(AOI, aoi_id)
+
         if not aoi:
-            return jsonify({"error": "AOI not found"}), 404
-        pairs = [p.to_dict() for p in aoi.image_pairs]
-        return jsonify({"pairs": pairs, "count": len(pairs)}), 200
+            return jsonify({
+                "error": "AOI not found"
+            }), 404
+
+        pairs = [
+            pair.to_dict()
+            for pair in aoi.image_pairs
+        ]
+
+        return jsonify({
+            "pairs": pairs,
+            "count": len(pairs),
+        }), 200
+
     finally:
         db.close()
 
-from flask import send_file
-import os
+
+# ---------------------------------------------------------------------------
+# Image-file helper
+# ---------------------------------------------------------------------------
+
+def _serve_pair_png(pair_id: str, filename: str):
+    """
+    Common PNG-serving implementation.
+    """
+
+    db = SessionLocal()
+
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+
+        if not pair:
+            return jsonify({
+                "error": "Image pair not found"
+            }), 404
+
+    finally:
+        db.close()
+
+    path = os.path.join(
+        _pair_data_dir(pair_id),
+        filename,
+    )
+
+    if not os.path.isfile(path):
+        return jsonify({
+            "error": "Image not found on disk"
+        }), 404
+
+    return send_file(
+        path,
+        mimetype="image/png",
+        max_age=0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/images/<pair_id>/before
+# ---------------------------------------------------------------------------
 
 def serve_before_png(pair_id: str):
-    """GET /api/images/<pair_id>/before"""
-    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", pair_id, "before_rgb.png")
-    if not os.path.exists(path):
-        return jsonify({"error": "Image not found on disk"}), 404
-    return send_file(path, mimetype="image/png")
+    """
+    GET /api/images/<pair_id>/before
+    """
+
+    return _serve_pair_png(
+        pair_id,
+        "before_rgb.png",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/images/<pair_id>/after
+# ---------------------------------------------------------------------------
 
 def serve_after_png(pair_id: str):
-    """GET /api/images/<pair_id>/after"""
-    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", pair_id, "after_rgb.png")
-    if not os.path.exists(path):
-        return jsonify({"error": "Image not found on disk"}), 404
-    return send_file(path, mimetype="image/png")
+    """
+    GET /api/images/<pair_id>/after
+    """
+
+    return _serve_pair_png(
+        pair_id,
+        "after_rgb.png",
+    )
+
+# ---------------------------------------------------------------------------
+# GET /api/images/<pair_id>/progress
+# ---------------------------------------------------------------------------
+
+def get_pair_progress(pair_id: str):
+    """
+    Return user-facing acquisition progress.
+
+    The DB status remains one of:
+        pending / fetching / done / error
+
+    Human-readable progress is stored separately in progress.json.
+    """
+    db = SessionLocal()
+
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+
+        if not pair:
+            return jsonify({
+                "error": "Image pair not found"
+            }), 404
+
+        status = pair.status
+    finally:
+        db.close()
+
+    path = os.path.join(_pair_data_dir(pair_id), PROGRESS_FILENAME)
+
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    else:
+        payload = {}
+
+    payload["pair_id"] = pair_id
+    payload["status"] = status
+
+    return jsonify(payload), 200
+
+
+# ---------------------------------------------------------------------------
+# GET /api/images/<pair_id>/acquisition
+# ---------------------------------------------------------------------------
+
+def get_pair_acquisition(pair_id: str):
+    """
+    Return non-image acquisition metadata written by the GEE worker.
+    """
+    db = SessionLocal()
+
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+
+        if not pair:
+            return jsonify({
+                "error": "Image pair not found"
+            }), 404
+    finally:
+        db.close()
+
+    path = os.path.join(_pair_data_dir(pair_id), ACQUISITION_FILENAME)
+
+    if not os.path.isfile(path):
+        return jsonify({
+            "error": "Acquisition metadata not found"
+        }), 404
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return jsonify({
+            "error": f"Invalid acquisition metadata: {exc}"
+        }), 500
+
+    return jsonify(payload), 200
+
+
+# ---------------------------------------------------------------------------
+# GET /api/images/<pair_id>/analysis
+# ---------------------------------------------------------------------------
+
+def get_pair_analysis(pair_id: str):
+    """
+    Return the completed inference/change-typing summary.
+
+    analysis.json is intentionally produced by the inference service, not by
+    the acquisition worker. This keeps satellite acquisition and model
+    inference separate and makes failures diagnosable.
+    """
+    db = SessionLocal()
+
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+
+        if not pair:
+            return jsonify({
+                "error": "Image pair not found"
+            }), 404
+    finally:
+        db.close()
+
+    path = os.path.join(_pair_data_dir(pair_id), ANALYSIS_FILENAME)
+
+    if not os.path.isfile(path):
+        return jsonify({
+            "status": "not_ready",
+            "message": "Model inference has not produced analysis.json yet.",
+        }), 404
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return jsonify({
+            "error": f"Invalid analysis metadata: {exc}"
+        }), 500
+
+    return jsonify(payload), 200
+
+
+# ---------------------------------------------------------------------------
+# Multicolor mask / T2 overlay
+# ---------------------------------------------------------------------------
+
+def _serve_analysis_png(pair_id: str, filename: str):
+    """
+    Serve an analysis PNG generated by the inference/change-typing service.
+    """
+    db = SessionLocal()
+
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+
+        if not pair:
+            return jsonify({
+                "error": "Image pair not found"
+            }), 404
+    finally:
+        db.close()
+
+    path = os.path.join(_pair_data_dir(pair_id), filename)
+
+    if not os.path.isfile(path):
+        return jsonify({
+            "error": "Analysis image not found on disk"
+        }), 404
+
+    return send_file(
+        path,
+        mimetype="image/png",
+        max_age=0,
+    )
+
+
+def serve_change_mask_png(pair_id: str):
+    """
+    GET /api/images/<pair_id>/mask
+
+    Expected artifact:
+        change_mask.png
+
+    This is the multicolor 7-class display mask:
+        no_change, water_gain, water_loss, construction,
+        veg_loss, veg_gain, other
+    plus uncertain=255.
+    """
+    return _serve_analysis_png(pair_id, "change_mask.png")
+
+
+def serve_t2_mask_png(pair_id: str):
+    """
+    GET /api/images/<pair_id>/t2-mask
+
+    Expected artifact:
+        t2_mask_overlay.png
+
+    This is the T2 RGB image with the multicolor change mask composited
+    on top, so the user can see exactly where each class occurs.
+    """
+    return _serve_analysis_png(pair_id, "t2_mask_overlay.png")
+
+
+# ---------------------------------------------------------------------------
+# GET /api/images/<pair_id>/legend
+# ---------------------------------------------------------------------------
+
+def get_change_legend(pair_id: str):
+    """
+    Return the fixed mask colour legend.
+
+    pair_id is validated first so the endpoint behaves consistently with the
+    other image-analysis endpoints.
+    """
+    db = SessionLocal()
+
+    try:
+        pair = db.get(AOIImagePair, pair_id)
+
+        if not pair:
+            return jsonify({
+                "error": "Image pair not found"
+            }), 404
+    finally:
+        db.close()
+
+    return jsonify({
+        "pair_id": pair_id,
+        "classes": CHANGE_LEGEND,
+    }), 200
