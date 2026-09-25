@@ -54,7 +54,7 @@ BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = os.path.join(BACKEND_ROOT, "data")
 
 PROGRESS_FILENAME = "progress.json"
-ACQUISITION_FILENAME = "acquisition.json"
+ACQUISITION_FILENAME = "run_metadata.json"
 ANALYSIS_FILENAME = "analysis.json"
 
 # Fixed UI legend for the multicolor change-type mask.
