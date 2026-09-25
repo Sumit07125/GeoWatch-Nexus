@@ -1,20 +1,13 @@
 """
-GeoWatch-Nexus AOI service
-===========================
-Canonical AOI validation/storage for the Geo-Nexus v3.2 application.
+GeoWatch-Nexus AOI service.
 
-API coordinate convention:
-    [lat, lon]
-
-GeoJSON convention is handled explicitly as [lon, lat] when geojson input is
-provided.
-
-Research geometry contract:
-    - WGS84 input
-    - UTM-area calculation
-    - northern-hemisphere UTM EPSG = 32600 + zone
-    - point AOIs are analysis centers, not zero-area analysis requests
-    - maximum requested polygon area = 100 km²
+Canonical application geometry contract
+---------------------------------------
+- API coordinate order: [lat, lon]
+- GeoJSON input order: [lon, lat], converted immediately to [lat, lon]
+- Polygon/rectangle area: WGS84 -> local UTM -> m²/hectares/km²
+- Point AOI: analysis center, expanded to an exact 1280 m model-tile footprint
+- Maximum polygon/rectangle area: 100 km²
 """
 
 from __future__ import annotations
@@ -24,8 +17,8 @@ from typing import Any
 
 from pyproj import Transformer
 from shapely.geometry import Polygon
-from shapely.validation import explain_validity
 from shapely.ops import transform as shapely_transform
+from shapely.validation import explain_validity
 
 from models.aoi import AOI
 from models.database import get_db
@@ -34,15 +27,13 @@ from models.database import get_db
 MAX_AOI_AREA_KM2 = 100.0
 DEFAULT_POINT_TILES = 1
 MAX_POINT_TILES = 5
-TILE_GROUND_M = 128 * 10  # 1,280 m
+PATCH_PX = 128
+RESOLUTION_M = 10
+TILE_GROUND_M = PATCH_PX * RESOLUTION_M
+GEOMETRY_VERSION = "geowatch-aoi-v4"
 
-
-# ---------------------------------------------------------------------------
-# Coordinate / geometry helpers
-# ---------------------------------------------------------------------------
 
 def _utm_epsg_from_lon(lon: float) -> int:
-    """Return WGS84 UTM EPSG for the northern hemisphere."""
     zone = int((lon + 180.0) // 6.0) + 1
     if not 1 <= zone <= 60:
         raise ValueError(f"Longitude produced invalid UTM zone: {zone}")
@@ -50,51 +41,48 @@ def _utm_epsg_from_lon(lon: float) -> int:
 
 
 def _validate_lat_lon(lat: float, lon: float) -> None:
-    if not (-90.0 <= lat <= 90.0):
+    if not -90.0 <= lat <= 90.0:
         raise ValueError(f"Invalid latitude: {lat}")
-    if not (-180.0 <= lon <= 180.0):
+    if not -180.0 <= lon <= 180.0:
         raise ValueError(f"Invalid longitude: {lon}")
 
 
-def validate_point_coordinate(coordinate: list[float]) -> tuple[float, float]:
-    """Validate and return a [lat, lon] point."""
+def validate_point_coordinate(coordinate: Any) -> tuple[float, float]:
     if not isinstance(coordinate, (list, tuple)) or len(coordinate) != 2:
         raise ValueError("Point must be [lat, lon]")
-
     try:
         lat = float(coordinate[0])
         lon = float(coordinate[1])
     except (TypeError, ValueError) as exc:
         raise ValueError("Point coordinates must be numeric") from exc
-
     _validate_lat_lon(lat, lon)
     return lat, lon
 
 
 def _parse_point_tiles(settings: dict[str, Any] | None) -> int:
     settings = settings or {}
-    raw = settings.get("analysis_tiles", settings.get("cover_area", "1x"))
+    raw = settings.get("analysis_tiles", settings.get("cover_area", DEFAULT_POINT_TILES))
 
-    if isinstance(raw, str):
+    if isinstance(raw, bool):
+        raise ValueError("analysis_tiles must be an integer from 1 to 5")
+    if isinstance(raw, int):
+        tiles = raw
+    elif isinstance(raw, str):
         value = raw.strip().lower()
         if value.endswith("x"):
             value = value[:-1]
         if not value.isdigit():
             raise ValueError("analysis_tiles/cover_area must be an integer from 1 to 5")
         tiles = int(value)
-    elif isinstance(raw, int):
-        tiles = raw
     else:
         raise ValueError("analysis_tiles/cover_area must be an integer from 1 to 5")
 
     if not 1 <= tiles <= MAX_POINT_TILES:
         raise ValueError(f"analysis_tiles must be between 1 and {MAX_POINT_TILES}")
-
     return tiles
 
 
 def _polygon_from_lat_lon(coordinates: list[list[float]]) -> Polygon:
-    """Create a valid Shapely polygon from [lat, lon] coordinates."""
     if not isinstance(coordinates, list) or len(coordinates) < 3:
         raise ValueError("Polygon requires at least 3 coordinate pairs")
 
@@ -102,23 +90,23 @@ def _polygon_from_lat_lon(coordinates: list[list[float]]) -> Polygon:
     for pair in coordinates:
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             raise ValueError("Every polygon coordinate must be [lat, lon]")
-        lat, lon = validate_point_coordinate(list(pair))
+        lat, lon = validate_point_coordinate(pair)
         lon_lat.append((lon, lat))
 
-    polygon = Polygon(lon_lat)
+    if lon_lat[0] != lon_lat[-1]:
+        lon_lat.append(lon_lat[0])
 
+    polygon = Polygon(lon_lat)
     if polygon.is_empty:
         raise ValueError("AOI polygon is empty")
     if not polygon.is_valid:
         raise ValueError(f"Invalid AOI polygon: {explain_validity(polygon)}")
     if polygon.area <= 0:
         raise ValueError("AOI polygon has zero area")
-
     return polygon
 
 
 def _geojson_to_lat_lon(data: dict[str, Any]) -> tuple[str, list[list[float]]]:
-    """Convert GeoJSON Point/Polygon coordinates to the service [lat, lon] format."""
     geometry_type = data.get("type")
     coords = data.get("coordinates")
 
@@ -130,10 +118,10 @@ def _geojson_to_lat_lon(data: dict[str, Any]) -> tuple[str, list[list[float]]]:
         return "point", [[lat, lon]]
 
     if geometry_type == "Polygon":
-        if not coords or not isinstance(coords, list) or not coords[0]:
+        if not isinstance(coords, list) or not coords or not isinstance(coords[0], list):
             raise ValueError("GeoJSON Polygon coordinates are empty")
         ring = coords[0]
-        lat_lon = []
+        lat_lon: list[list[float]] = []
         for pair in ring:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                 raise ValueError("GeoJSON Polygon coordinates must be [lon, lat]")
@@ -145,22 +133,35 @@ def _geojson_to_lat_lon(data: dict[str, Any]) -> tuple[str, list[list[float]]]:
     raise ValueError("Only GeoJSON Point and Polygon are supported")
 
 
+def _same_utm_zone(polygon: Polygon, centroid_lon: float) -> bool:
+    target = _utm_epsg_from_lon(centroid_lon)
+    for lon, _lat in polygon.exterior.coords:
+        if _utm_epsg_from_lon(float(lon)) != target:
+            return False
+    return True
+
+
 def calculate_geometry_area(coordinates: list[list[float]]) -> dict[str, float | int]:
-    """Calculate ellipsoidal/UTM area for a polygon represented as [lat, lon]."""
     polygon = _polygon_from_lat_lon(coordinates)
     centroid_lon = float(polygon.centroid.x)
-    utm_epsg = _utm_epsg_from_lon(centroid_lon)
 
+    if not _same_utm_zone(polygon, centroid_lon):
+        raise ValueError(
+            "AOI crosses a UTM zone boundary. Keep the analysis AOI inside one UTM zone."
+        )
+
+    utm_epsg = _utm_epsg_from_lon(centroid_lon)
     transformer = Transformer.from_crs(
         "EPSG:4326",
         f"EPSG:{utm_epsg}",
         always_xy=True,
     )
-
     projected = shapely_transform(transformer.transform, polygon)
     area_m2 = float(projected.area)
     area_km2 = area_m2 / 1_000_000.0
 
+    if area_km2 <= 0:
+        raise ValueError("AOI polygon has zero projected area")
     if area_km2 > MAX_AOI_AREA_KM2:
         raise ValueError(
             f"AOI is too large: {area_km2:.2f} km² "
@@ -176,12 +177,11 @@ def calculate_geometry_area(coordinates: list[list[float]]) -> dict[str, float |
 
 
 def calculate_point_analysis_area(tiles: int = DEFAULT_POINT_TILES) -> dict[str, float | int]:
-    """Return the exact square analysis footprint represented by nx model tiles."""
     if not 1 <= tiles <= MAX_POINT_TILES:
         raise ValueError(f"analysis_tiles must be between 1 and {MAX_POINT_TILES}")
 
-    side_m = tiles * TILE_GROUND_M
-    area_m2 = float(side_m * side_m)
+    side_m = float(tiles * TILE_GROUND_M)
+    area_m2 = side_m * side_m
     return {
         "area_m2": area_m2,
         "area_hectares": area_m2 / 10_000.0,
@@ -190,17 +190,16 @@ def calculate_point_analysis_area(tiles: int = DEFAULT_POINT_TILES) -> dict[str,
 
 
 def _normalise_input(data: dict[str, Any]) -> tuple[str, list[list[float]]]:
-    """Return (shape_type, coordinates) in the canonical [lat, lon] format."""
-    geojson = data.get("geojson") or data.get("geometry")
-    if isinstance(geojson, dict) and geojson.get("type"):
-        return _geojson_to_lat_lon(geojson)
+    geometry = data.get("geojson") or data.get("geometry")
+    if isinstance(geometry, dict) and geometry.get("type"):
+        return _geojson_to_lat_lon(geometry)
 
     coordinates = data.get("coordinates")
     shape_type = data.get("shape_type")
 
     if not isinstance(coordinates, list) or not coordinates:
         raise ValueError("coordinates must be a non-empty list of [lat, lon] pairs")
-    if shape_type not in ("polygon", "rectangle", "point"):
+    if shape_type not in {"polygon", "rectangle", "point"}:
         raise ValueError("shape_type must be 'polygon', 'rectangle', or 'point'")
 
     if shape_type == "point":
@@ -216,9 +215,27 @@ def _normalise_input(data: dict[str, Any]) -> tuple[str, list[list[float]]]:
     return shape_type, coordinates
 
 
-# ---------------------------------------------------------------------------
-# CRUD
-# ---------------------------------------------------------------------------
+def _build_settings(
+    settings: dict[str, Any],
+    shape_type: str,
+    coordinates: list[list[float]],
+    area_info: dict[str, float | int],
+) -> dict[str, Any]:
+    out = dict(settings)
+    out.update(
+        {
+            "geometry_version": GEOMETRY_VERSION,
+            "coordinate_order": "lat_lon",
+            "area_m2": float(area_info["area_m2"]),
+            "area_hectares": float(area_info["area_hectares"]),
+            "area_km2": float(area_info["area_km2"]),
+            "utm_epsg": int(area_info["utm_epsg"]),
+            "input_shape_type": shape_type,
+            "input_coordinates": coordinates,
+        }
+    )
+    return out
+
 
 def create_aoi(data: dict[str, Any]):
     try:
@@ -228,21 +245,13 @@ def create_aoi(data: dict[str, Any]):
         if shape_type == "point":
             tiles = _parse_point_tiles(settings)
             area_info = calculate_point_analysis_area(tiles)
-            lat, lon = validate_point_coordinate(coordinates[0])
+            _lat, lon = validate_point_coordinate(coordinates[0])
             area_info["utm_epsg"] = _utm_epsg_from_lon(lon)
             settings["analysis_tiles"] = tiles
         else:
             area_info = calculate_geometry_area(coordinates)
 
-        settings.update(
-            {
-                "geometry_version": "geowatch-aoi-v3",
-                "coordinate_order": "lat_lon",
-                "area_m2": area_info["area_m2"],
-                "area_km2": area_info["area_km2"],
-                "utm_epsg": area_info.get("utm_epsg"),
-            }
-        )
+        settings = _build_settings(settings, shape_type, coordinates, area_info)
 
         aoi = AOI(
             name=data.get("name", "Untitled AOI"),
@@ -309,19 +318,32 @@ def update_aoi(aoi_id, data: dict[str, Any]):
         if not aoi:
             return None, "AOI not found"
 
-        if any(key in data for key in ("coordinates", "shape_type", "geojson", "geometry", "settings")):
+        geometry_changed = any(
+            key in data for key in ("coordinates", "shape_type", "geojson", "geometry", "settings")
+        )
+
+        if geometry_changed:
             combined = {
                 "coordinates": aoi.coordinates,
                 "shape_type": aoi.shape_type,
                 "settings": dict(aoi.settings or {}),
             }
-            combined.update({k: v for k, v in data.items() if k in {"coordinates", "shape_type", "geojson", "geometry", "settings"}})
+            combined.update(
+                {
+                    key: data[key]
+                    for key in ("coordinates", "shape_type", "geojson", "geometry", "settings")
+                    if key in data
+                }
+            )
+
             shape_type, coordinates = _normalise_input(combined)
             settings = dict(combined.get("settings") or {})
 
             if shape_type == "point":
                 tiles = _parse_point_tiles(settings)
                 area_info = calculate_point_analysis_area(tiles)
+                _lat, lon = validate_point_coordinate(coordinates[0])
+                area_info["utm_epsg"] = _utm_epsg_from_lon(lon)
                 settings["analysis_tiles"] = tiles
             else:
                 area_info = calculate_geometry_area(coordinates)
@@ -329,16 +351,7 @@ def update_aoi(aoi_id, data: dict[str, Any]):
             aoi.shape_type = shape_type
             aoi.coordinates = coordinates
             aoi.area_hectares = float(area_info["area_hectares"])
-            settings.update(
-                {
-                    "geometry_version": "geowatch-aoi-v2",
-                    "coordinate_order": "lat_lon",
-                    "area_m2": area_info["area_m2"],
-                    "area_km2": area_info["area_km2"],
-                    "utm_epsg": area_info.get("utm_epsg"),
-                }
-            )
-            aoi.settings = settings
+            aoi.settings = _build_settings(settings, shape_type, coordinates, area_info)
 
         if "name" in data:
             aoi.name = data["name"]

@@ -49,7 +49,7 @@ from pyproj import Transformer
 from shapely.geometry import Polygon
 from shapely.ops import transform as shapely_transform
 
-from services.model_registry import get_model_config
+from services.model_registry import get_model_config, validate_model_contract
 
 
 PATCH_PX = 128
@@ -57,6 +57,7 @@ RESOLUTION = 10
 GROUND_M = PATCH_PX * RESOLUTION
 MAX_GRID_PX = 10_000
 DOWNLOAD_LIMIT_BYTES = 30 * 1024 * 1024
+MAX_AOI_AREA_KM2 = 100.0
 MAX_POINT_TILES = 5
 
 S2_COLLECTION = "COPERNICUS/S2_SR_HARMONIZED"
@@ -198,7 +199,10 @@ def point_analysis_grid(lat: float, lon: float, nx: int = 1) -> dict[str, Any]:
     xmax = x + half
     ymax = y + half
 
-    return _grid_metadata(xmin, ymin, xmax, ymax, epsg)
+    grid = _grid_metadata(xmin, ymin, xmax, ymax, epsg)
+    grid["centroid_lat"] = float(lat)
+    grid["centroid_lon"] = float(lon)
+    return grid
 
 
 def _grid_metadata(xmin: float, ymin: float, xmax: float, ymax: float, epsg: int) -> dict[str, Any]:
@@ -243,6 +247,13 @@ def _polygon_analysis_grid(coordinates: list[list[float]]) -> tuple[dict[str, An
 
     to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
     polygon_utm = shapely_transform(to_utm.transform, polygon_wgs84)
+    area_km2 = float(polygon_utm.area) / 1_000_000.0
+    if area_km2 <= 0.0:
+        raise ValueError("AOI polygon has zero projected area")
+    if area_km2 > MAX_AOI_AREA_KM2:
+        raise ValueError(
+            f"AOI is too large: {area_km2:.2f} km² (maximum {MAX_AOI_AREA_KM2:.2f} km²)"
+        )
 
     minx, miny, maxx, maxy = polygon_utm.bounds
     tile = float(GROUND_M)
@@ -253,6 +264,10 @@ def _polygon_analysis_grid(coordinates: list[list[float]]) -> tuple[dict[str, An
     ymax = math.ceil(maxy / tile) * tile
 
     grid = _grid_metadata(xmin, ymin, xmax, ymax, epsg)
+    centroid_lat = float(polygon_wgs84.centroid.y)
+    centroid_lon = float(polygon_wgs84.centroid.x)
+    grid["centroid_lat"] = centroid_lat
+    grid["centroid_lon"] = centroid_lon
     return grid, polygon_wgs84
 
 
@@ -406,6 +421,7 @@ def _optical_composite(d0: str, d1: str, aoi: ee.Geometry) -> ee.Image:
 
 
 def _s2_quality_summary(d0: str, d1: str, aoi: ee.Geometry) -> dict[str, float | int]:
+    """Compute scene count and clear-observation statistics with minimal sync calls."""
     collection = _s2_collection(d0, d1, aoi)
     scene_count = int(collection.size().getInfo())
     if scene_count <= 0:
@@ -413,37 +429,37 @@ def _s2_quality_summary(d0: str, d1: str, aoi: ee.Geometry) -> dict[str, float |
 
     csp = ee.ImageCollection(CLOUD_SCORE_COLLECTION)
     masked = collection.linkCollection(csp, ["cs_cdf"]).map(
-        lambda img: img.updateMask(img.select("cs_cdf").gte(CLEAR_THR)).select(S2_BANDS)
+        lambda img: img.updateMask(
+            img.select("cs_cdf").gte(CLEAR_THR)
+        ).select("B4")
     )
-    n_clear = masked.select("B4").count().rename("n_clear").unmask(0)
+    n_clear = masked.count().rename("n_clear").unmask(0)
 
     valid_fraction = n_clear.gt(0).reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=aoi,
-        scale=10,
+        scale=RESOLUTION,
         maxPixels=100_000_000,
+        bestEffort=True,
     ).get("n_clear")
 
-    mean_clear = n_clear.reduceRegion(
-        reducer=ee.Reducer.mean(),
+    stats = n_clear.reduceRegion(
+        reducer=ee.Reducer.mean().combine(
+            reducer2=ee.Reducer.minMax(),
+            sharedInputs=True,
+        ),
         geometry=aoi,
-        scale=10,
+        scale=RESOLUTION,
         maxPixels=100_000_000,
-    ).get("n_clear")
-
-    min_max = n_clear.reduceRegion(
-        reducer=ee.Reducer.minMax(),
-        geometry=aoi,
-        scale=10,
-        maxPixels=100_000_000,
+        bestEffort=True,
     ).getInfo() or {}
 
     result = {
         "scene_count": scene_count,
         "clear_coverage_fraction": float(valid_fraction.getInfo() or 0.0),
-        "n_clear_mean": float(mean_clear.getInfo() or 0.0),
-        "n_clear_min": int(min_max.get("n_clear_min", 0)),
-        "n_clear_max": int(min_max.get("n_clear_max", 0)),
+        "n_clear_mean": float(stats.get("n_clear_mean", 0.0)),
+        "n_clear_min": int(stats.get("n_clear_min", 0)),
+        "n_clear_max": int(stats.get("n_clear_max", 0)),
     }
 
     if result["clear_coverage_fraction"] <= 0.0:
@@ -451,7 +467,6 @@ def _s2_quality_summary(d0: str, d1: str, aoi: ee.Geometry) -> dict[str, float |
             f"Sentinel-2 scenes exist for {d0} to {d1}, but no pixel has a clear "
             f"observation at cs_cdf >= {CLEAR_THR:.2f}."
         )
-
     return result
 
 
@@ -579,6 +594,7 @@ def _write_ee_geotiff(
         "crs_transform": grid["transform"],
         "dimensions": [grid["width_px"], grid["height_px"]],
         "format": "GEO_TIFF",
+        "filePerBand": False,
     }
     if bands:
         params["bands"] = bands
@@ -687,8 +703,7 @@ def fetch_image_pair(
       - use temporal_mode='custom' with all four explicit dates for custom runs.
     """
     config = get_model_config(model_id)
-    if config["input_channels"] != 17 or config["patch_size"] != 128 or config["resolution_m"] != 10:
-        raise ValueError("Model registry contract is incompatible with Geo-Nexus v3.2")
+    validate_model_contract(model_id)
 
     if update_progress:
         update_progress("Initializing Earth Engine...")
@@ -701,10 +716,13 @@ def fetch_image_pair(
         cover_area=cover_area,
     )
 
-    if temporal_mode == "custom" and (before_date or after_date) and not (before_start or before_end or after_start or after_end):
+    if temporal_mode == "custom" and (before_date or after_date) and not all(
+        [before_start, before_end, after_start, after_end]
+    ):
         raise ValueError(
-            "Custom mode no longer accepts implicit 90-day windows. "
-            "Provide before_start, before_end, after_start and after_end explicitly."
+            "Custom mode requires four explicit dates: before_start, before_end, "
+            "after_start, after_end. before_date/after_date are legacy fields and "
+            "never create implicit 90-day windows."
         )
 
     t1, t2 = resolve_temporal_windows(
@@ -715,24 +733,14 @@ def fetch_image_pair(
         after_end=after_end,
     )
 
-    # Legacy date fields are intentionally ignored in research mode to preserve
-    # the trained K30 temporal distribution.
+    # In research mode, the trained K30 seasonal windows are authoritative.
+    # Legacy before_date/after_date fields do not alter this contract.
     t1_start, t1_end = t1
     t2_start, t2_end = t2
 
     # Prefer the research-lock orbit for the three established project regions.
-    center_lat = lat
-    center_lon = lon
-    if (center_lat is None or center_lon is None) and aoi and aoi.get("coordinates"):
-        shape = aoi.get("shape_type")
-        coords = aoi.get("coordinates")
-        if shape == "point" and coords:
-            center_lat, center_lon = float(coords[0][0]), float(coords[0][1])
-        elif shape in ("polygon", "rectangle"):
-            poly = _lat_lon_polygon(coords)
-            center_lat = float(poly.centroid.y)
-            center_lon = float(poly.centroid.x)
-
+    center_lat = grid.get("centroid_lat")
+    center_lon = grid.get("centroid_lon")
     preferred_orbit = _preferred_orbit_for_point(center_lat, center_lon, model_id)
 
     if update_progress:
@@ -761,13 +769,11 @@ def fetch_image_pair(
     opt2 = _optical_composite(t2_start, t2_end, acquisition_geom)
     sar2 = _sar_composite(t2_start, t2_end, acquisition_geom, common_orbit)
 
+    # Filesystem paths are always backend-generated. pair_id is metadata only.
     run_id = uuid.uuid4().hex
-    if pair_id:
-        requested_pair_id = str(pair_id)[:128]
-    else:
-        requested_pair_id = None
+    requested_pair_id = str(pair_id)[:128] if pair_id is not None else None
 
-    data_dir = Path(__file__).resolve().parent.parent / "data" / run_id
+    data_dir = Path(__file__).resolve().parent.parent / "data" / "runs" / run_id
     data_dir.mkdir(parents=True, exist_ok=True)
 
     optical1_raw, sar1_raw = _storage_images(opt1, sar1)
@@ -818,11 +824,18 @@ def fetch_image_pair(
 
     tiles = _build_tiles(grid)
 
+    analysis_area_m2 = float(grid["width_px"] * grid["height_px"] * RESOLUTION * RESOLUTION)
     metadata = {
         "run_id": run_id,
+        "analysis_area_m2": analysis_area_m2,
+        "analysis_area_km2": analysis_area_m2 / 1_000_000.0,
         "requested_pair_id": requested_pair_id,
         "model_id": model_id,
         "shape_type": shape_type,
+        "centroid": {
+            "lat": grid.get("centroid_lat"),
+            "lon": grid.get("centroid_lon"),
+        },
         "temporal_mode": temporal_mode,
         "research_protocol": temporal_mode == "research",
         "t1_window": [t1_start, t1_end],
@@ -848,6 +861,7 @@ def fetch_image_pair(
             "instrument_mode": "IW",
             "pass": "DESCENDING",
             "relative_orbit": common_orbit,
+            "preferred_relative_orbit": preferred_orbit,
             "t1_scene_count": s1_count_t1,
             "t2_scene_count": s1_count_t2,
             "storage_scale_db": SAR_STORAGE_SCALE,
