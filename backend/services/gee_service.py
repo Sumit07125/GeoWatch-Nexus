@@ -748,9 +748,57 @@ def _get_common_relative_orbit(
         update_progress=update_progress,
     ) or {}
 
-    # EE histogram keys may be strings even for numeric properties.
+    # EE histogram keys for relativeOrbitNumber_start are DOUBLE-typed, so
+    # Earth Engine returns keys like "136.0" not "136". int("136.0") raises
+    # ValueError; we must go via float() first.
     def _hist_int_key(h: dict) -> dict[int, int]:
-        return {int(k): int(v) for k, v in h.items()}
+        """
+        Normalize Earth Engine aggregate_histogram() keys for
+        relativeOrbitNumber_start.
+
+        Sentinel-1 exposes relativeOrbitNumber_start as a DOUBLE, so Earth
+        Engine may return keys such as "136.0" rather than "136".
+
+        Only mathematically integral finite values are accepted.
+        """
+        normalized: dict[int, int] = {}
+        for raw_key, raw_count in h.items():
+            try:
+                numeric_key = float(raw_key)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid Sentinel-1 relative orbit key from Earth Engine: "
+                    f"{raw_key!r}"
+                ) from exc
+
+            if not math.isfinite(numeric_key):
+                raise ValueError(
+                    f"Non-finite Sentinel-1 relative orbit key: {raw_key!r}"
+                )
+            if not numeric_key.is_integer():
+                raise ValueError(
+                    f"Non-integral Sentinel-1 relative orbit key: {raw_key!r}"
+                )
+
+            orbit = int(numeric_key)
+
+            try:
+                count = int(float(raw_count))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid Sentinel-1 orbit count for orbit {raw_key!r}: "
+                    f"{raw_count!r}"
+                ) from exc
+
+            if count < 0:
+                raise ValueError(
+                    f"Negative Sentinel-1 orbit count for orbit {orbit}: {count}"
+                )
+
+            normalized[orbit] = normalized.get(orbit, 0) + count
+
+        return normalized
+
 
     t1_counts = _hist_int_key(t1_hist)
     t2_counts = _hist_int_key(t2_hist)
