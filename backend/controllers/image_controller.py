@@ -479,14 +479,36 @@ def _do_fetch(
     # ------------------------------------------------------------------
     # Run acquisition with an adaptive tile-aware timeout
     # ------------------------------------------------------------------
+
+    # ── Heartbeat thread ──────────────────────────────────────────────
+    # Writes updated_at timestamp to progress.json every 60 s so the
+    # stale-detection logic (based on progress.json mtime) never falsely
+    # marks a long-running but active GEE download as stale.
+    _HEARTBEAT_INTERVAL = 60  # seconds
+
+    def _heartbeat_loop() -> None:
+        while not timeout_event.wait(timeout=_HEARTBEAT_INTERVAL):
+            if timeout_event.is_set():
+                break
+            try:
+                _write_progress(pair_id, "Acquisition in progress (heartbeat)...", state="fetching")
+            except Exception:
+                pass
+
+    hb_thread = _threading.Thread(
+        target=_heartbeat_loop, daemon=True, name=f"geowatch-hb-{pair_id}"
+    )
+    hb_thread.start()
+
     t = _threading.Thread(target=_run_acquisition, daemon=True, name=f"geowatch-inner-{pair_id}")
     t.start()
     t.join(timeout=timeout_secs)
 
+    # Stop the heartbeat (signal via timeout_event; it watches for it)
+    timeout_event.set()
+
     if t.is_alive():
-        # Timeout fired — signal inner thread to stop writing progress,
-        # then atomically mark the pair as error.
-        timeout_event.set()
+        # Timeout fired — atomically mark the pair as error.
         _mark_pair_error(
             pair_id,
             f"Satellite acquisition timed out after {timeout_secs // 60} minutes "
@@ -496,9 +518,6 @@ def _do_fetch(
 
     if "error" in _result:
         _mark_pair_error(pair_id, _result["error"])
-
-
-
 
 # ---------------------------------------------------------------------------
 # POST /api/aoi/<id>/fetch-images

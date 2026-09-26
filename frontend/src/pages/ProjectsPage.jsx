@@ -9,7 +9,8 @@
  *       Up to Nx tiles stitched into one mosaic.
  */
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
+
 import Sidebar from "../components/Sidebar";
 import TopBar from "../components/TopBar";
 import {
@@ -186,6 +187,7 @@ function ProjectCard({ aoi, onDelete, onFetch }) {
   const [fetching, setFetching] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [progressMessages, setProgressMessages] = useState({}); // { pairId: message }
+  const pairsRef = useRef([]); // always reflects the current pairs without stale closure
 
   const lat = aoi.coordinates?.[0]?.[0];
   const lon = aoi.coordinates?.[0]?.[1];
@@ -195,7 +197,9 @@ function ProjectCard({ aoi, onDelete, onFetch }) {
     setLoadingPairs(true);
     try {
       const data = await fetchImagePairs(aoi.id);
-      setPairs(data.pairs || []);
+      const p = data.pairs || [];
+      pairsRef.current = p;
+      setPairs(p);
     } catch {
       setPairs([]);
     } finally {
@@ -206,23 +210,19 @@ function ProjectCard({ aoi, onDelete, onFetch }) {
   // Poll while any pair is fetching — also poll progress endpoint for detailed messages
   useEffect(() => {
     let interval;
-    const checkAndPoll = async () => {
-      await loadPairs();
-    };
-    
-    checkAndPoll();
-    
+
+    loadPairs();
+
     interval = setInterval(async () => {
-      const currentPairs = await new Promise(resolve => {
-        setPairs(prev => { resolve(prev); return prev; });
-      });
+      // Read current pairs via ref — no stale closure, no React anti-pattern
+      const currentPairs = pairsRef.current;
       const isFetching = currentPairs.some(p => p.status !== "done" && p.status !== "error");
       if (expanded || isFetching) {
-        loadPairs();
         if (isFetching && !expanded) {
           setExpanded(true); // Auto-expand if a background fetch is running
         }
-        // Also fetch progress messages for fetching pairs
+        await loadPairs();
+        // Fetch progress messages for fetching pairs
         const fetchingPairs = currentPairs.filter(p => p.status === "fetching");
         for (const p of fetchingPairs) {
           try {
@@ -234,9 +234,10 @@ function ProjectCard({ aoi, onDelete, onFetch }) {
         }
       }
     }, 2000);
-    
+
     return () => clearInterval(interval);
-  }, [expanded, loadPairs]);
+  }, [expanded, loadPairs]); // pairsRef is stable, no dependency needed
+
 
   const handleFetch = async () => {
     setFetching(true);

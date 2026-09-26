@@ -799,12 +799,48 @@ def fetch_image_pair(
 
     if use_full_download:
         if update_progress:
-            update_progress("Downloading research-compatible GeoTIFF stacks...")
+            update_progress("Downloading research-compatible GeoTIFF stacks (4 products)...")
 
-        _write_ee_geotiff(optical1_raw, data_dir / "before_optical.tif", grid)
-        _write_ee_geotiff(optical2_raw, data_dir / "after_optical.tif", grid)
-        _write_ee_geotiff(sar1_raw, data_dir / "before_sar.tif", grid)
-        _write_ee_geotiff(sar2_raw, data_dir / "after_sar.tif", grid)
+        downloads = [
+            (optical1_raw, data_dir / "before_optical.tif", "before_optical"),
+            (optical2_raw, data_dir / "after_optical.tif",  "after_optical"),
+            (sar1_raw,     data_dir / "before_sar.tif",     "before_sar"),
+            (sar2_raw,     data_dir / "after_sar.tif",      "after_sar"),
+        ]
+
+        import threading as _dl_threading
+        _dl_lock = _dl_threading.Lock()
+        completed_dl: list[int] = [0]
+
+        def _dl_one(image, path, name):
+            _write_ee_geotiff(image, path, grid)
+            with _dl_lock:
+                completed_dl[0] += 1
+                done = completed_dl[0]
+                if update_progress:
+                    update_progress(f"Downloaded {name} [{done}/4 products done]")
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        _MAX_DL_WORKERS = 2
+        futures_map = {}
+        try:
+            with ThreadPoolExecutor(max_workers=_MAX_DL_WORKERS,
+                                    thread_name_prefix="geowatch-dl") as pool:
+                for image, path, name in downloads:
+                    futures_map[pool.submit(_dl_one, image, path, name)] = name
+                for future in _as_completed(futures_map):
+                    future.result()  # re-raise worker exceptions
+        except Exception as concurrent_err:
+            # Sequential fallback: if concurrent downloads failed, try one-by-one
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "Concurrent download failed (%s); falling back to sequential.", concurrent_err
+            )
+            for image, path, name in downloads:
+                if update_progress:
+                    update_progress(f"Downloading {name} (sequential fallback)...")
+                _write_ee_geotiff(image, path, grid)
+
     else:
         if update_progress:
             update_progress("AOI is too large for one download; acquiring 128x128 model tiles...")
@@ -831,12 +867,15 @@ def fetch_image_pair(
                 completed_jobs[0] += 1
                 done = completed_jobs[0]
                 if update_progress:
-                    tile_num = (tile["row"] * max(1, int(grid.get("n_cols", 1))) + tile["col"] + 1)
+                    # Derive n_cols from grid pixel width — grid dict never exposes n_cols directly
+                    _n_cols = max(1, grid["width_px"] // PATCH_PX)
+                    tile_num = tile["row"] * _n_cols + tile["col"] + 1
                     update_progress(
                         f"Downloading tile {tile_num}/{n_tiles} "
                         f"({prefix}) [{done}/{total_jobs} downloads done]"
                     )
             return key, str(path)
+
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
         futures = []

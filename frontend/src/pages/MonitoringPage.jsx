@@ -537,14 +537,27 @@ function MonitoringPageInner() {
       setLegend((legendData && legendData.classes) || {});
       setImgKey(k => k + 1);
     } catch (err) {
-      const msg = (err && err.response && err.response.data &&
-        (err.response.data.message || err.response.data.error)) || "Detection analysis failed.";
+      // Build an informative message from the structured backend response when available.
+      let msg;
+      const data = err && err.response && err.response.data;
+      if (data) {
+        const backendMsg = data.message || data.error || "";
+        const stage = data.stage && data.stage !== "unknown" ? ` [stage: ${data.stage}]` : "";
+        const exType = data.exception_type ? ` (${data.exception_type})` : "";
+        msg = backendMsg ? `${backendMsg}${stage}${exType}` : "Model analysis failed — check backend logs.";
+      } else if (err && err.request) {
+        // Request was sent but no response received (connection reset, timeout, etc.)
+        msg = "Analysis request failed before the backend returned a response. Check backend logs.";
+      } else {
+        msg = (err && err.message) || "Detection analysis failed.";
+      }
       setAnalysisError(msg);
-      showToast("error", msg);
+      showToast("error", msg.length > 120 ? msg.slice(0, 120) + "…" : msg);
     } finally {
       setAnalysing(false);
     }
   }, [selectedPairId, pairDone, analysing, showToast]);
+
 
   // ── Handle threshold change — debounced ──
   const applyThreshold = useCallback(async (pct) => {

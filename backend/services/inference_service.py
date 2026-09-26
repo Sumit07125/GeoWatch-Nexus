@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 import re
 import threading
@@ -124,6 +125,54 @@ _TILE_RE = re.compile(
     r"^(?P<prefix>before_optical|after_optical|before_sar|after_sar)_r(?P<row>\d+)_c(?P<col>\d+)\.tif$",
     re.IGNORECASE,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def warm_up_model() -> None:
+    """
+    Pre-initialize the K30 model and run one synthetic forward pass so that
+    the first real user analysis request is never penalised by cold start.
+
+    Call this once from app.py BEFORE Flask starts serving requests.
+    Guard against double-invocation when the Flask reloader is enabled:
+    the reloader runs the app twice, but the second process inherits the
+    already-loaded model via the global _MODEL reference.
+    """
+    global _MODEL, _MODEL_DEVICE, _MODEL_ERROR
+
+    # Already warmed up in this process
+    if _MODEL is not None:
+        return
+
+    logger.info("K30 model warm-up started")
+    try:
+        model, device = _load_model()
+
+        # Dry-run: one synthetic (1, 17, 128, 128) batch to force GPU kernel compilation
+        dummy = torch.zeros(1, INPUT_CHANNELS, PAIR_PATCH, PAIR_PATCH,
+                            dtype=torch.float32, device=device)
+        with torch.inference_mode():
+            _ = model(dummy, dummy)
+            if device.type == "xpu":
+                try:
+                    torch.xpu.synchronize()
+                except Exception:
+                    pass
+            elif device.type == "cuda":
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+
+        logger.info("K30 model warm-up completed: device=%s", device)
+
+    except Exception as exc:
+        # Keep the server alive; the real error will surface on the first
+        # /analyze call and the health endpoint will expose it.
+        _MODEL_ERROR = str(exc)
+        logger.error("K30 model warm-up failed: %s", exc)
+
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
