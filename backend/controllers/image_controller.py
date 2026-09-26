@@ -218,8 +218,22 @@ def _write_json_artifact(pair_id: str, filename: str, payload: dict[str, Any]) -
 # Background fetch worker helpers
 # ---------------------------------------------------------------------------
 
-_FETCH_TIMEOUT_SECONDS = 900  # 15 minutes hard wall-clock limit
-_STALE_FETCH_MINUTES  = 20    # mark as error if stuck in 'fetching' longer than this
+_MAX_FETCH_TIMEOUT_SECONDS = 3600  # absolute maximum: 60 minutes
+_STALE_HEARTBEAT_MINUTES   = 20    # if no progress.json heartbeat for this long, mark stale
+
+
+def _fetch_timeout_seconds(nx: int) -> int:
+    """
+    Return a tile-count-aware hard timeout for the acquisition worker.
+
+    1x1  -> 15 min
+    2x2  -> 30 min
+    3x3  -> 45 min
+    >=4  -> 60 min (capped)
+    """
+    clamped_nx = max(1, int(nx))
+    timeout_minutes = min(60, 15 + 15 * (clamped_nx - 1))
+    return timeout_minutes * 60
 
 
 def _mark_pair_error(pair_id: str, message: str) -> None:
@@ -290,10 +304,22 @@ def _do_fetch(
     - before_date / after_date are retained as legacy display values.
     - The full AOI payload is passed when available so polygon/rectangle AOIs
       are handled correctly.
-    - A hard wall-clock timeout of _FETCH_TIMEOUT_SECONDS is enforced. If the
-      GEE call does not finish within that window the pair is marked 'error'.
+    - A tile-count-aware wall-clock timeout is enforced (15–60 min).
+    - A shared timeout_event is used so the progress writer exits cleanly
+      if the timeout fires before the worker finishes.
     """
     import threading as _threading
+
+    # Parse tile count from cover_area to compute adaptive timeout
+    try:
+        nx = int(str(cover_area).rstrip("x"))
+    except (ValueError, TypeError):
+        nx = 1
+    timeout_secs = _fetch_timeout_seconds(nx)
+
+    # timeout_event: set by the outer thread when the timeout fires,
+    # read by the progress callback so it skips writes after expiry.
+    timeout_event = _threading.Event()
 
     # Shared result container for the inner worker thread.
     _result: dict[str, Any] = {}
@@ -333,6 +359,9 @@ def _do_fetch(
             db.commit()
 
             def update_progress(message: str) -> None:
+                # Do not write progress after the timeout has fired.
+                if timeout_event.is_set():
+                    return
                 _write_progress(pair_id, message, state="fetching")
 
             update_progress("Initializing acquisition...")
@@ -448,18 +477,20 @@ def _do_fetch(
             db.close()
 
     # ------------------------------------------------------------------
-    # Run acquisition with a hard timeout
+    # Run acquisition with an adaptive tile-aware timeout
     # ------------------------------------------------------------------
     t = _threading.Thread(target=_run_acquisition, daemon=True, name=f"geowatch-inner-{pair_id}")
     t.start()
-    t.join(timeout=_FETCH_TIMEOUT_SECONDS)
+    t.join(timeout=timeout_secs)
 
     if t.is_alive():
-        # Thread is still running beyond timeout — mark error and return.
-        # The inner thread will eventually finish or be cleaned up by the daemon.
+        # Timeout fired — signal inner thread to stop writing progress,
+        # then atomically mark the pair as error.
+        timeout_event.set()
         _mark_pair_error(
             pair_id,
-            f"Satellite acquisition timed out after {_FETCH_TIMEOUT_SECONDS // 60} minutes.",
+            f"Satellite acquisition timed out after {timeout_secs // 60} minutes "
+            f"(tile count={nx}).",
         )
         return
 
@@ -544,30 +575,42 @@ def trigger_fetch(aoi_id: str):
         # If the AOI already has a pair in 'fetching', return it rather than
         # spawning a second competing GEE worker.
         # GUARD 3 — Stale-fetch recovery
-        # If a pair has been stuck in 'fetching' for > _STALE_FETCH_MINUTES,
-        # reset it to 'error' so the user can retry cleanly.
+        # If a pair in 'fetching' has had no progress heartbeat for
+        # > _STALE_HEARTBEAT_MINUTES minutes, reset it to 'error' so the
+        # user can retry cleanly.
         # ------------------------------------------------------------------
 
         existing_pairs = aoi.image_pairs or []
         for ep in existing_pairs:
             if ep.status == "fetching":
-                # Calculate age of the fetch attempt
+                # Check how long ago the progress file was last updated.
+                # A running acquisition writes progress.json every few seconds.
                 stale = False
-                if ep.created_at:
-                    try:
-                        from datetime import timedelta
-                        age = datetime.now(timezone.utc) - ep.created_at.replace(tzinfo=timezone.utc)
-                        if age > timedelta(minutes=_STALE_FETCH_MINUTES):
+                try:
+                    from datetime import timedelta
+                    progress_path = os.path.join(_pair_data_dir(str(ep.id)), "progress.json")
+                    if os.path.isfile(progress_path):
+                        mtime = os.path.getmtime(progress_path)
+                        import time as _time
+                        heartbeat_age_minutes = (_time.time() - mtime) / 60.0
+                        if heartbeat_age_minutes > _STALE_HEARTBEAT_MINUTES:
                             stale = True
-                    except Exception:
-                        pass
+                    else:
+                        # No progress file yet — fall back to creation time
+                        if ep.created_at:
+                            age = datetime.now(timezone.utc) - ep.created_at.replace(tzinfo=timezone.utc)
+                            if age > timedelta(minutes=_STALE_HEARTBEAT_MINUTES):
+                                stale = True
+                except Exception:
+                    pass
 
                 if stale:
                     # Reset stale pair to error so a fresh fetch can proceed.
                     ep.status = "error"
                     ep.error_message = (
-                        f"Acquisition did not complete within {_STALE_FETCH_MINUTES} minutes "
-                        f"and was automatically marked as failed. Please retry."
+                        f"Acquisition lost progress heartbeat for more than "
+                        f"{_STALE_HEARTBEAT_MINUTES} minutes and was automatically "
+                        f"marked as failed. Please retry."
                     )
                     db.commit()
                     _write_progress(
@@ -576,6 +619,7 @@ def trigger_fetch(aoi_id: str):
                         state="error",
                     )
                     break  # allow a new pair to be created below
+
                 else:
                     # Active fetch in progress — return existing pair
                     return jsonify({
@@ -861,7 +905,6 @@ def run_pair_analysis(pair_id: str):
 
         # Keep the existing progress file separate from the canonical DB status.
         try:
-            data_dir = _pair_data_dir(pair_id)
             _write_progress(pair_id, "Starting model inference...", state="analyzing")
         except Exception:
             pass
@@ -876,12 +919,29 @@ def run_pair_analysis(pair_id: str):
         return jsonify(result), 200
 
     except Exception as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).exception(
+            "[run_pair_analysis] Analysis failed for pair %s", pair_id
+        )
         _write_progress(pair_id, str(exc), state="analysis_error")
+
+        # Extract stage from RuntimeError message if present
+        exc_msg = str(exc)
+        stage = "unknown"
+        if "K30 analysis failed during stage '" in exc_msg:
+            try:
+                stage = exc_msg.split("K30 analysis failed during stage '")[1].split("'")[0]
+            except Exception:
+                pass
+
         return jsonify({
             "error": "Model analysis failed",
-            "message": str(exc),
+            "message": exc_msg,
+            "stage": stage,
+            "exception_type": type(exc).__name__,
             "pair_id": pair_id,
         }), 500
+
 
 
 # ---------------------------------------------------------------------------

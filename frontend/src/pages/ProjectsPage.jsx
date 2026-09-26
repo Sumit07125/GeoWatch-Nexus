@@ -17,6 +17,7 @@ import {
   deleteAOI,
   triggerImageFetch,
   fetchImagePairs,
+  fetchPairProgress,
   beforeImageUrl,
   afterImageUrl,
 } from "../api/aoiApi";
@@ -59,7 +60,7 @@ function StatusBadge({ status }) {
 }
 
 // ── Image pair viewer ─────────────────────────────────────────────────────────
-function ImagePairCard({ pair }) {
+function ImagePairCard({ pair, progressMessage }) {
   const nx = pair.nx || 1;
   const patchPx = pair.patch_px || 128;
   const resMtr  = pair.resolution_m || 10;
@@ -89,21 +90,44 @@ function ImagePairCard({ pair }) {
         Ground: {groundM} m × {groundM} m = {groundKm} km × {groundKm} km = {areaKm2} km²
       </div>
 
-      {/* Date windows */}
+      {/* Analysis windows (actual research windows from GEE) */}
       {pair.t1_window && pair.t1_window[0] && (
         <div style={{ display: "flex", gap: "12px", marginBottom: "12px" }}>
           <div style={{ flex: 1, background: "var(--bg-white)", borderRadius: "8px", padding: "8px 12px", fontSize: "12px" }}>
-            <div style={{ color: "var(--text-muted)", marginBottom: "2px" }}>T1 Window (Before)</div>
+            <div style={{ color: "var(--text-muted)", marginBottom: "2px" }}>📅 T1 Analysis Window (Before)</div>
             <div style={{ fontWeight: 600, color: "var(--text-dark)" }}>{pair.t1_window[0]} → {pair.t1_window[1]}</div>
+            <div style={{ fontSize: "10px", color: "var(--text-muted)", marginTop: "2px" }}>Research-grade composite period</div>
           </div>
           <div style={{ flex: 1, background: "var(--bg-white)", borderRadius: "8px", padding: "8px 12px", fontSize: "12px" }}>
-            <div style={{ color: "var(--text-muted)", marginBottom: "2px" }}>T2 Window (After)</div>
-            <div style={{ fontWeight: 600, color: "var(--text-dark)" }}>{pair.t2_window[0]} → {pair.t2_window[1]}</div>
+            <div style={{ color: "var(--text-muted)", marginBottom: "2px" }}>📅 T2 Analysis Window (After)</div>
+            <div style={{ fontWeight: 600, color: "var(--text-dark)" }}>{pair.t1_window && pair.t2_window ? `${pair.t2_window[0]} → ${pair.t2_window[1]}` : '—'}</div>
+            <div style={{ fontSize: "10px", color: "var(--text-muted)", marginTop: "2px" }}>Research-grade composite period</div>
           </div>
         </div>
       )}
 
+      {/* Live progress message during fetch */}
+      {pair.status === "fetching" && progressMessage && (
+        <div style={{
+          background: "var(--bg-body)",
+          border: "1px solid var(--border)",
+          borderRadius: "8px",
+          padding: "8px 12px",
+          marginBottom: "12px",
+          fontSize: "11px",
+          color: "var(--text-muted)",
+          fontFamily: "monospace",
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+        }}>
+          <span style={{ width: "10px", height: "10px", border: "2px solid rgba(30,64,175,0.3)", borderTopColor: "#1e40af", borderRadius: "50%", display: "inline-block", animation: "spin 1s linear infinite", flexShrink: 0 }} />
+          {progressMessage}
+        </div>
+      )}
+
       {/* Images */}
+
       {pair.status === "done" && (
         <div style={{ display: "flex", gap: "12px" }}>
           <div style={{ flex: 1, textAlign: "center" }}>
@@ -161,6 +185,7 @@ function ProjectCard({ aoi, onDelete, onFetch }) {
   const [loadingPairs, setLoadingPairs] = useState(false);
   const [fetching, setFetching] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [progressMessages, setProgressMessages] = useState({}); // { pairId: message }
 
   const lat = aoi.coordinates?.[0]?.[0];
   const lon = aoi.coordinates?.[0]?.[1];
@@ -178,28 +203,36 @@ function ProjectCard({ aoi, onDelete, onFetch }) {
     }
   }, [aoi.id]);
 
-  // Poll while any pair is fetching, or if expanded
+  // Poll while any pair is fetching — also poll progress endpoint for detailed messages
   useEffect(() => {
     let interval;
     const checkAndPoll = async () => {
-      // First load
       await loadPairs();
     };
     
     checkAndPoll();
     
-    interval = setInterval(() => {
-      // Only poll if expanded, or if we know something is actively fetching
-      setPairs((currentPairs) => {
-        const isFetching = currentPairs.some(p => p.status !== "done" && p.status !== "error");
-        if (expanded || isFetching) {
-          loadPairs();
-          if (isFetching && !expanded) {
-            setExpanded(true); // Auto-expand if a background fetch is running
-          }
-        }
-        return currentPairs;
+    interval = setInterval(async () => {
+      const currentPairs = await new Promise(resolve => {
+        setPairs(prev => { resolve(prev); return prev; });
       });
+      const isFetching = currentPairs.some(p => p.status !== "done" && p.status !== "error");
+      if (expanded || isFetching) {
+        loadPairs();
+        if (isFetching && !expanded) {
+          setExpanded(true); // Auto-expand if a background fetch is running
+        }
+        // Also fetch progress messages for fetching pairs
+        const fetchingPairs = currentPairs.filter(p => p.status === "fetching");
+        for (const p of fetchingPairs) {
+          try {
+            const prog = await fetchPairProgress(p.id);
+            if (prog && prog.message) {
+              setProgressMessages(prev => ({ ...prev, [p.id]: prog.message }));
+            }
+          } catch { /* ignore */ }
+        }
+      }
     }, 2000);
     
     return () => clearInterval(interval);
@@ -324,7 +357,7 @@ function ProjectCard({ aoi, onDelete, onFetch }) {
             </div>
           )}
           {pairs.map((pair) => (
-            <ImagePairCard key={pair.id} pair={pair} />
+            <ImagePairCard key={pair.id} pair={pair} progressMessage={progressMessages[pair.id]} />
           ))}
         </div>
       )}

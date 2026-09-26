@@ -295,7 +295,7 @@ def _read_single_tiff(path: Path) -> np.ndarray:
     return arr
 
 
-def _read_stack(pair_dir: Path, prefix: str, expected_bands: int) -> np.ndarray:
+def _read_stack(pair_dir: Path, prefix: str, expected_bands: int, run_meta: dict | None = None) -> np.ndarray:
     direct = pair_dir / f"{prefix}.tif"
     if direct.is_file():
         arr = _read_single_tiff(direct)
@@ -311,33 +311,82 @@ def _read_stack(pair_dir: Path, prefix: str, expected_bands: int) -> np.ndarray:
             f"Neither {direct.name} nor tile directory {tile_dir} exists"
         )
 
-    pieces: list[tuple[int, int, np.ndarray]] = []
+    # Determine expected grid from run_metadata if available
+    expected_positions: set[tuple[int, int]] | None = None
+    if run_meta and "tiles" in run_meta:
+        expected_positions = {(int(t["row"]), int(t["col"])) for t in run_meta["tiles"]}
+
+    positions: dict[tuple[int, int], np.ndarray] = {}
     for path in sorted(tile_dir.glob(f"{prefix}_r*_c*.tif")):
         match = _TILE_RE.match(path.name)
         if not match:
             continue
         row = int(match.group("row"))
         col = int(match.group("col"))
+        pos = (row, col)
+        if pos in positions:
+            raise ValueError(f"{prefix}: duplicate tile at position {pos}: {path.name}")
         arr = _read_single_tiff(path)
         if arr.shape[0] != expected_bands:
             raise ValueError(
                 f"{path.name}: expected {expected_bands} bands, got {arr.shape[0]}"
             )
-        pieces.append((row, col, arr))
+        # Strict: every tile must be exactly PAIR_PATCH x PAIR_PATCH
+        if arr.shape[1:] != (PAIR_PATCH, PAIR_PATCH):
+            raise ValueError(
+                f"{path.name}: expected tile spatial shape ({PAIR_PATCH},{PAIR_PATCH}), "
+                f"got {arr.shape[1:]}"
+            )
+        positions[pos] = arr
 
-    if not pieces:
+    if not positions:
         raise FileNotFoundError(f"No {prefix}_r*_c*.tif tiles found under {tile_dir}")
 
-    tile_h = max(p[2].shape[1] for p in pieces)
-    tile_w = max(p[2].shape[2] for p in pieces)
-    height = (max(p[0] for p in pieces) + 1) * tile_h
-    width = (max(p[1] for p in pieces) + 1) * tile_w
+    # Validate that the grid is complete
+    if expected_positions is not None:
+        missing = expected_positions - set(positions.keys())
+        extra = set(positions.keys()) - expected_positions
+        if missing:
+            raise ValueError(f"{prefix}: missing tiles at positions {sorted(missing)}")
+        if extra:
+            raise ValueError(f"{prefix}: unexpected extra tiles at positions {sorted(extra)}")
+    else:
+        # Build grid from actual positions; require it forms a complete rectangle
+        rows = sorted({p[0] for p in positions})
+        cols = sorted({p[1] for p in positions})
+        for r in rows:
+            for c in cols:
+                if (r, c) not in positions:
+                    raise ValueError(
+                        f"{prefix}: tile grid is incomplete; missing tile at row={r}, col={c}"
+                    )
 
-    out = np.zeros((expected_bands, height, width), dtype=pieces[0][2].dtype)
-    for row, col, arr in pieces:
-        h, w = arr.shape[1:]
-        out[:, row * tile_h:row * tile_h + h, col * tile_w:col * tile_w + w] = arr
+    # Reconstruct from sorted tile positions
+    rows = sorted({p[0] for p in positions})
+    cols = sorted({p[1] for p in positions})
+    n_rows = len(rows)
+    n_cols = len(cols)
+    height = n_rows * PAIR_PATCH
+    width = n_cols * PAIR_PATCH
+    row_idx = {r: i for i, r in enumerate(rows)}
+    col_idx = {c: i for i, c in enumerate(cols)}
+
+    out = np.zeros((expected_bands, height, width), dtype=next(iter(positions.values())).dtype)
+    for (row, col), arr in positions.items():
+        ri = row_idx[row]
+        ci = col_idx[col]
+        out[:, ri * PAIR_PATCH:(ri + 1) * PAIR_PATCH, ci * PAIR_PATCH:(ci + 1) * PAIR_PATCH] = arr
     return out
+
+
+def _validate_numeric_stack(name: str, arr: np.ndarray) -> None:
+    """Raise FloatingPointError if arr contains any non-finite values."""
+    if not np.isfinite(arr).all():
+        bad = int((~np.isfinite(arr)).sum())
+        raise FloatingPointError(
+            f"{name} contains {bad} non-finite values; "
+            f"shape={arr.shape}, dtype={arr.dtype}"
+        )
 
 
 def _derive_17_channels(opt1_raw: np.ndarray, sar1_raw: np.ndarray,
@@ -345,24 +394,41 @@ def _derive_17_channels(opt1_raw: np.ndarray, sar1_raw: np.ndarray,
     """
     Convert stored research-compatible 14-channel raw stacks to two 17-channel
     physical tensors before normalization.
+
+    Strict shape contract: all four raster stacks MUST have identical spatial
+    dimensions. Silent min-cropping is forbidden to prevent corrupted tile
+    layouts from producing wrong model inputs.
     """
     if opt1_raw.shape[0] != 12 or opt2_raw.shape[0] != 12:
         raise ValueError("Optical stack must contain 11 S2 bands + n_clear")
     if sar1_raw.shape[0] != 2 or sar2_raw.shape[0] != 2:
         raise ValueError("SAR stack must contain VV + VH")
 
-    h = min(opt1_raw.shape[1], opt2_raw.shape[1], sar1_raw.shape[1], sar2_raw.shape[1])
-    w = min(opt1_raw.shape[2], opt2_raw.shape[2], sar1_raw.shape[2], sar2_raw.shape[2])
+    # Strict spatial shape check — no silent cropping
+    shapes = {
+        "before_optical": opt1_raw.shape[1:],
+        "before_sar": sar1_raw.shape[1:],
+        "after_optical": opt2_raw.shape[1:],
+        "after_sar": sar2_raw.shape[1:],
+    }
+    if len(set(shapes.values())) != 1:
+        raise ValueError(
+            f"Stored raster spatial shapes do not match: {shapes}. "
+            "All four stacks (before/after optical/SAR) must have the same H×W."
+        )
 
-    opt1_all = opt1_raw[:, :h, :w].astype(np.float32)
-    opt2_all = opt2_raw[:, :h, :w].astype(np.float32)
+    h, w = opt1_raw.shape[1:]
+
+    opt1_all = opt1_raw.astype(np.float32)
+    opt2_all = opt2_raw.astype(np.float32)
     opt1 = opt1_all[:11] / ARRAY_SCALE
     opt2 = opt2_all[:11] / ARRAY_SCALE
     nclear1 = np.clip(opt1_all[11] / Q_TARGET, 0.0, 1.0)
     nclear2 = np.clip(opt2_all[11] / Q_TARGET, 0.0, 1.0)
     # S1 GeoTIFFs store dB * 100; restore physical dB here.
-    sar1 = sar1_raw[:, :h, :w].astype(np.float32) / SAR_EXTRA_SCALE
-    sar2 = sar2_raw[:, :h, :w].astype(np.float32) / SAR_EXTRA_SCALE
+    sar1 = sar1_raw.astype(np.float32) / SAR_EXTRA_SCALE
+    sar2 = sar2_raw.astype(np.float32) / SAR_EXTRA_SCALE
+
 
     def build(opt: np.ndarray, sar: np.ndarray, q: np.ndarray) -> np.ndarray:
         b3, b4, b8, b11 = opt[1], opt[2], opt[6], opt[9]
@@ -420,7 +486,8 @@ def _iter_patches(x1: np.ndarray, x2: np.ndarray):
 
 def _run_binary_inference(x1: np.ndarray, x2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     model, device = _load_model()
-    batch_size = max(1, int(os.getenv("GEOWATCH_INFERENCE_BATCH", "4")))
+    # Default batch_size=1 for safe XPU execution; override with GEOWATCH_INFERENCE_BATCH
+    batch_size = max(1, int(os.getenv("GEOWATCH_INFERENCE_BATCH", "1")))
 
     h, w = x1.shape[1:]
     probability = np.zeros((h, w), dtype=np.float32)
@@ -445,27 +512,84 @@ def _run_binary_inference(x1: np.ndarray, x2: np.ndarray) -> tuple[np.ndarray, n
     return probability, mean_gates.astype(np.float32)
 
 
-def _infer_batch(model: torch.nn.Module, device: torch.device, items, probability: np.ndarray):
+def _infer_batch(model: torch.nn.Module, device: torch.device, items: list, probability: np.ndarray):
+    """Run a batch of patches through the model with XPU sync and recursive split fallback."""
     arr1 = np.stack([i[4] for i in items], axis=0)
     arr2 = np.stack([i[5] for i in items], axis=0)
     t1 = torch.from_numpy(np.ascontiguousarray(arr1)).to(device=device, dtype=torch.float32)
     t2 = torch.from_numpy(np.ascontiguousarray(arr2)).to(device=device, dtype=torch.float32)
 
-    with torch.inference_mode():
-        out = model(t1, t2)
-        logits = out["logits"]
-        probs = torch.sigmoid(logits).detach().float().cpu().numpy()[:, 0]
-        gates = out.get("gates", [])
-        gate_means = np.zeros((4,), dtype=np.float64)
-        gate_count = len(items)
-        if gates:
-            for idx, gate in enumerate(gates[:4]):
-                gate_means[idx] = float(gate.float().mean().detach().cpu())
+    try:
+        with torch.inference_mode():
+            out = model(t1, t2)
+            # XPU execution may be async — synchronize before extracting outputs
+            if device.type == "xpu":
+                try:
+                    torch.xpu.synchronize()
+                except Exception as xpu_sync_err:
+                    raise RuntimeError(
+                        f"XPU synchronization failed after model forward: {xpu_sync_err}"
+                    ) from xpu_sync_err
+            logits = out["logits"]
+            probs = torch.sigmoid(logits).detach().float().cpu().numpy()[:, 0]
+            gates = out.get("gates", [])
+            gate_means = np.zeros((4,), dtype=np.float64)
+            gate_count = len(items)
+            if gates:
+                for idx, gate in enumerate(gates[:4]):
+                    gate_means[idx] = float(gate.float().mean().detach().cpu())
 
-    for i, (row, col, h2, w2, *_rest) in enumerate(items):
-        probability[row:row + h2, col:col + w2] = probs[i, :h2, :w2]
+        for i, (row, col, h2, w2, *_rest) in enumerate(items):
+            probability[row:row + h2, col:col + w2] = probs[i, :h2, :w2]
 
-    return gate_means, gate_count
+        return gate_means, gate_count
+
+    except RuntimeError as batch_err:
+        if len(items) > 1:
+            # Recursive split: try smaller sub-batches
+            import logging
+            logging.getLogger(__name__).warning(
+                "Batch of %d patches failed on %s (%s); splitting in half.",
+                len(items), device, batch_err,
+            )
+            mid = len(items) // 2
+            g1, c1 = _infer_batch(model, device, items[:mid], probability)
+            g2, c2 = _infer_batch(model, device, items[mid:], probability)
+            return g1 + g2, c1 + c2
+        # Single item still failed — try CPU fallback before re-raising
+        if device.type != "cpu":
+            import logging
+            logging.getLogger(__name__).warning(
+                "Single-patch XPU inference failed (%s); attempting CPU fallback.", batch_err
+            )
+            cpu_dev = torch.device("cpu")
+            cpu_t1 = t1.cpu()
+            cpu_t2 = t2.cpu()
+            # Reload model on CPU using same checkpoint
+            global _MODEL, _MODEL_DEVICE
+            from pathlib import Path as _Path
+            _model_source = MODEL_ROOT / "p3_geonexus_model.py"
+            _checkpoint = MODEL_ROOT / "mh_fewshot_best_k30.pth"
+            _module = _load_module_from_file(_model_source)
+            _state = _checkpoint_state(_checkpoint)
+            _cpu_model = _module.GeoNexusCD(decoder="lka")
+            _cpu_model.load_state_dict(_state, strict=False)
+            _cpu_model.set_mode("gated")
+            _cpu_model.eval()
+            _cpu_model = _cpu_model.to("cpu")
+            with torch.inference_mode():
+                out2 = _cpu_model(cpu_t1, cpu_t2)
+                logits2 = out2["logits"]
+                probs2 = torch.sigmoid(logits2).detach().float().cpu().numpy()[:, 0]
+                gates2 = out2.get("gates", [])
+                gate_means2 = np.zeros((4,), dtype=np.float64)
+                if gates2:
+                    for idx2, gate2 in enumerate(gates2[:4]):
+                        gate_means2[idx2] = float(gate2.float().mean().detach().cpu())
+            for i, (row, col, h2, w2, *_rest) in enumerate(items):
+                probability[row:row + h2, col:col + w2] = probs2[i, :h2, :w2]
+            return gate_means2, len(items)
+        raise
 
 
 def _apply_binary_morphology(mask: np.ndarray) -> np.ndarray:
@@ -666,6 +790,11 @@ def _write_progress(pair_dir: Path, pair_id: str, message: str, state: str) -> N
 
 def analyze_pair(pair_id: str, *, progress_callback=None) -> dict[str, Any]:
     """Run K30 inference + spectral change typing and persist UI artifacts."""
+    import logging
+    import traceback as _traceback
+
+    logger = logging.getLogger(__name__)
+
     if pair_id in {".", ".."} or "/" in pair_id or "\\" in pair_id:
         raise ValueError("Invalid pair_id")
 
@@ -678,137 +807,188 @@ def analyze_pair(pair_id: str, *, progress_callback=None) -> dict[str, Any]:
         if progress_callback:
             progress_callback(message)
 
-    progress("Loading stored T1/T2 GeoTIFF stacks...")
+    # Load run_metadata for grid validation (optional — not required)
+    run_meta: dict[str, Any] | None = None
+    meta_path = pair_dir / "run_metadata.json"
+    if meta_path.is_file():
+        try:
+            with meta_path.open("r", encoding="utf-8") as _f:
+                run_meta = json.load(_f)
+        except Exception:
+            run_meta = None
 
-    opt1_raw = _read_stack(pair_dir, "before_optical", 12)
-    opt2_raw = _read_stack(pair_dir, "after_optical", 12)
-    sar1_raw = _read_stack(pair_dir, "before_sar", 2)
-    sar2_raw = _read_stack(pair_dir, "after_sar", 2)
+    stage = "input_read"
+    try:
+        progress("Loading stored T1/T2 GeoTIFF stacks...")
 
-    progress("Building the exact 17-channel model inputs...")
-    x1, x2 = _derive_17_channels(opt1_raw, sar1_raw, opt2_raw, sar2_raw)
-    mu, sd, norm_meta = _load_normalization()
-    x1n = _normalize_17(x1, mu, sd)
-    x2n = _normalize_17(x2, mu, sd)
+        opt1_raw = _read_stack(pair_dir, "before_optical", 12, run_meta)
+        opt2_raw = _read_stack(pair_dir, "after_optical", 12, run_meta)
+        sar1_raw = _read_stack(pair_dir, "before_sar", 2, run_meta)
+        sar2_raw = _read_stack(pair_dir, "after_sar", 2, run_meta)
 
-    progress("Running Geo-Nexus K30 inference...")
-    probability, gates = _run_binary_inference(x1n, x2n)
-    binary = probability >= THRESHOLD
-    binary = _apply_binary_morphology(binary)
+        # Print diagnostic info
+        for _name, _arr in [("before_optical", opt1_raw), ("after_optical", opt2_raw),
+                             ("before_sar", sar1_raw), ("after_sar", sar2_raw)]:
+            logger.info(
+                "[analyze_pair] %s: shape=%s dtype=%s min=%s max=%s",
+                _name, _arr.shape, _arr.dtype, _arr.min(), _arr.max(),
+            )
 
-    q = np.clip(x1[16], 0.0, 1.0)
-    low_q_percent = 100.0 * float((q < 0.25).mean())
+        # Validate no non-finite values in raw integer stacks (cast to float first)
+        _validate_numeric_stack("before_optical (float)", opt1_raw.astype(np.float32))
+        _validate_numeric_stack("after_optical (float)", opt2_raw.astype(np.float32))
+        _validate_numeric_stack("before_sar (float)", sar1_raw.astype(np.float32))
+        _validate_numeric_stack("after_sar (float)", sar2_raw.astype(np.float32))
 
-    progress("Assigning spectral change types...")
-    labels = _change_typing(x1, x2, binary, q)
+        stage = "channel_construction"
+        progress("Building the exact 17-channel model inputs...")
+        x1, x2 = _derive_17_channels(opt1_raw, sar1_raw, opt2_raw, sar2_raw)
+        _validate_numeric_stack("x1 (17-channel T1)", x1)
+        _validate_numeric_stack("x2 (17-channel T2)", x2)
+        logger.info("[analyze_pair] 17-channel tensors: x1=%s x2=%s", x1.shape, x2.shape)
 
-    total_pixels = int(labels.size)
-    changed_pixels = int(np.isin(labels, [1, 2, 3, 4, 5, 6, 255]).sum())
-    class_stats = _class_statistics(labels, total_pixels)
+        stage = "normalization"
+        mu, sd, norm_meta = _load_normalization()
+        x1n = _normalize_17(x1, mu, sd)
+        x2n = _normalize_17(x2, mu, sd)
+        _validate_numeric_stack("x1n (normalized)", x1n)
+        _validate_numeric_stack("x2n (normalized)", x2n)
 
-    progress("Calculating metrics and area statistics...")
-    gt = _load_ground_truth(pair_dir, probability.shape)
-    if gt is None:
-        gt_metrics = {
-            "ground_truth_available": False,
-            "threshold": THRESHOLD,
-            "precision": None,
-            "recall": None,
-            "f1": None,
-            "iou": None,
-            "accuracy": None,
-            "average_precision": None,
+        stage = "model_loading"
+        # Model is lazily loaded on first inference call
+
+        stage = "model_inference"
+        progress("Running Geo-Nexus K30 inference...")
+        probability, gates = _run_binary_inference(x1n, x2n)
+        binary = probability >= THRESHOLD
+        binary = _apply_binary_morphology(binary)
+
+        q = np.clip(x1[16], 0.0, 1.0)
+        low_q_percent = 100.0 * float((q < 0.25).mean())
+
+        stage = "change_typing"
+        progress("Assigning spectral change types...")
+        labels = _change_typing(x1, x2, binary, q)
+
+        stage = "metrics"
+        total_pixels = int(labels.size)
+        changed_pixels = int(np.isin(labels, [1, 2, 3, 4, 5, 6, 255]).sum())
+        class_stats = _class_statistics(labels, total_pixels)
+
+        progress("Calculating metrics and area statistics...")
+        gt = _load_ground_truth(pair_dir, probability.shape)
+        if gt is None:
+            gt_metrics = {
+                "ground_truth_available": False,
+                "threshold": THRESHOLD,
+                "precision": None,
+                "recall": None,
+                "f1": None,
+                "iou": None,
+                "accuracy": None,
+                "average_precision": None,
+            }
+        else:
+            gt_metrics = _binary_metrics(probability, gt, THRESHOLD)
+
+        stage = "artifact_generation"
+        # Verified K30 release-level benchmark values — NOT for this AOI.
+        benchmark = {
+            "scope": "Geo-Nexus P4b K30 verified benchmark",
+            "threshold": 0.28,
+            "mh_val": {
+                "f1": 0.739389,
+            },
+            "mh_test": {
+                "f1": 0.636976,
+                "iou": 0.467325,
+                "average_precision": 0.699608,
+                "precision": None,
+                "recall": None,
+            },
+            "note": "Benchmark metrics are not ground-truth metrics for this arbitrary AOI.",
         }
-    else:
-        gt_metrics = _binary_metrics(probability, gt, THRESHOLD)
 
-    # Verified K30 release-level benchmark values. These are model benchmark
-    # results, not metrics measured on this particular user's AOI.
-    benchmark = {
-        "scope": "Geo-Nexus P4b K30 verified benchmark",
-        "threshold": 0.28,
-        "mh_val": {
-            "f1": 0.739389,
-        },
-        "mh_test": {
-            "f1": 0.636976,
-            "iou": 0.467325,
-            "average_precision": 0.699608,
-            "precision": None,
-            "recall": None,
-        },
-        "note": "Benchmark metrics are not ground-truth metrics for this arbitrary AOI.",
-    }
+        # Save machine-readable arrays for later UI/tooling.
+        np.save(pair_dir / "change_probability.npy", probability.astype(np.float32))
+        np.save(pair_dir / "change_mask_binary.npy", binary.astype(np.uint8))
+        np.save(pair_dir / "change_type_mask.npy", labels.astype(np.uint8))
 
-    # Save machine-readable arrays for later UI/tooling without making them API payloads.
-    np.save(pair_dir / "change_probability.npy", probability.astype(np.float32))
-    np.save(pair_dir / "change_mask_binary.npy", binary.astype(np.uint8))
-    np.save(pair_dir / "change_type_mask.npy", labels.astype(np.uint8))
+        _save_binary_png(binary, pair_dir / "change_mask_binary.png")
+        _save_mask_png(labels, pair_dir / "change_mask.png")
+        _save_t2_overlay(pair_dir, labels, pair_dir / "t2_mask_overlay.png")
 
-    _save_binary_png(binary, pair_dir / "change_mask_binary.png")
-    _save_mask_png(labels, pair_dir / "change_mask.png")
-    _save_t2_overlay(pair_dir, labels, pair_dir / "t2_mask_overlay.png")
+        class_percent_total_change = 100.0 * changed_pixels / max(total_pixels, 1)
+        analysis = {
+            "pair_id": pair_id,
+            "status": "complete",
+            "model": {
+                "model_id": "geonexus_p4b_k30",
+                "version": "Geo-Nexus-v3.2-P4b-K30",
+                "task": "binary_change_detection",
+                "input_channels": INPUT_CHANNELS,
+                "patch_size": PAIR_PATCH,
+                "resolution_m": RESOLUTION_M,
+                "stride": INFERENCE_STRIDE,
+                "threshold": THRESHOLD,
+                "threshold_source": "MH-VAL",
+                "mode": "gated",
+                "device": str(_MODEL_DEVICE) if _MODEL_DEVICE is not None else "unknown",
+            },
+            "channels": {
+                "order": CHANNEL_ORDER,
+                "normalization_file": norm_meta.get("name", "norm_stats_trainonly.json"),
+                "array_scale": ARRAY_SCALE,
+                "sar_extra_scale": SAR_EXTRA_SCALE,
+                "q_target": Q_TARGET,
+            },
+            "input_shape": {
+                "height": int(probability.shape[0]),
+                "width": int(probability.shape[1]),
+                "pixels": total_pixels,
+            },
+            "quality": {
+                "q_mean": float(q.mean()),
+                "q_min": float(q.min()),
+                "q_max": float(q.max()),
+                "low_q_below_0_25_percent": low_q_percent,
+                "mean_gate_per_scale": [float(v) for v in gates],
+            },
+            "binary_detection": {
+                "changed_pixels_before_display_typing": int(binary.sum()),
+                "changed_area_m2_before_typing": int(binary.sum()) * 100,
+                "changed_area_km2_before_typing": float(binary.sum()) * 100 / 1_000_000,
+                "changed_percent_before_display_typing": 100.0 * float(binary.mean()),
+                "typed_or_uncertain_percent": class_percent_total_change,
+            },
+            "class_statistics": class_stats,
+            "ground_truth_metrics": gt_metrics,
+            "model_benchmark": benchmark,
+            "change_typing": {
+                "version": "spectral_rules_v1",
+                "classes": CLASS_NAMES,
+                "confidence_warning": (
+                    "Change-type labels are derived from spectral rules on the detected "
+                    "binary-change pixels. They are not native K30 multiclass logits and "
+                    "should be presented as change typing, not ground truth."
+                ),
+            },
+        }
 
-    class_percent_total_change = 100.0 * changed_pixels / max(total_pixels, 1)
-    analysis = {
-        "pair_id": pair_id,
-        "status": "complete",
-        "model": {
-            "model_id": "geonexus_p4b_k30",
-            "version": "Geo-Nexus-v3.2-P4b-K30",
-            "task": "binary_change_detection",
-            "input_channels": INPUT_CHANNELS,
-            "patch_size": PAIR_PATCH,
-            "resolution_m": RESOLUTION_M,
-            "stride": INFERENCE_STRIDE,
-            "threshold": THRESHOLD,
-            "threshold_source": "MH-VAL",
-            "mode": "gated",
-            "device": str(_MODEL_DEVICE) if _MODEL_DEVICE is not None else "unknown",
-        },
-        "channels": {
-            "order": CHANNEL_ORDER,
-            "normalization_file": norm_meta.get("name", "norm_stats_trainonly.json"),
-            "array_scale": ARRAY_SCALE,
-            "sar_extra_scale": SAR_EXTRA_SCALE,
-            "q_target": Q_TARGET,
-        },
-        "input_shape": {
-            "height": int(probability.shape[0]),
-            "width": int(probability.shape[1]),
-            "pixels": total_pixels,
-        },
-        "quality": {
-            "q_mean": float(q.mean()),
-            "q_min": float(q.min()),
-            "q_max": float(q.max()),
-            "low_q_below_0_25_percent": low_q_percent,
-            "mean_gate_per_scale": [float(v) for v in gates],
-        },
-        "binary_detection": {
-            "changed_pixels_before_display_typing": int(binary.sum()),
-            "changed_area_m2_before_typing": int(binary.sum()) * 100,
-            "changed_area_km2_before_typing": float(binary.sum()) * 100 / 1_000_000,
-            "changed_percent_before_display_typing": 100.0 * float(binary.mean()),
-            "typed_or_uncertain_percent": class_percent_total_change,
-        },
-        "class_statistics": class_stats,
-        "ground_truth_metrics": gt_metrics,
-        "model_benchmark": benchmark,
-        "change_typing": {
-            "version": "spectral_rules_v1",
-            "classes": CLASS_NAMES,
-            "confidence_warning": (
-                "Change-type labels are derived from spectral rules on the detected "
-                "binary-change pixels. They are not native K30 multiclass logits and "
-                "should be presented as change typing, not ground truth."
-            ),
-        },
-    }
+        _atomic_json(pair_dir / "analysis.json", analysis)
+        _write_progress(pair_dir, pair_id, "Model analysis completed.", "analysis_done")
+        return analysis
 
-    _atomic_json(pair_dir / "analysis.json", analysis)
-    _write_progress(pair_dir, pair_id, "Model analysis completed.", "analysis_done")
-    return analysis
+
+    except Exception as exc:
+        logger.exception(
+            "[analyze_pair] K30 analysis failed at stage '%s' for pair %s",
+            stage, pair_id,
+        )
+        raise RuntimeError(
+            f"K30 analysis failed during stage '{stage}': "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def apply_threshold(pair_id: str, threshold: float) -> dict[str, Any]:

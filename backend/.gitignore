@@ -11,10 +11,18 @@ env/
 
 # Environment variables & Credentials
 .env
-*.json
 credentials.json
 token.json
 satellite-based-*.json
+
+# JSON files are excluded, EXCEPT required model runtime files below.
+*.json
+!models/geonexus_v3_2_k30/norm_stats_trainonly.json
+!models/geonexus_v3_2_k30/geonexus_model_registry.json
+!models/geonexus_v3_2_k30/p4b_config.json
+!models/geonexus_v3_2_k30/P4b_RELEASE_MANIFEST.json
+!models/geonexus_v3_2_k30/P4b_RELEASE_METADATA.json
+!models/geonexus_v3_2_k30/manifest.json
 
 # Data store (auto-generated)
 data/

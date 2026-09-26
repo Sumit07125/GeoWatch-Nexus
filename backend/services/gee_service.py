@@ -812,18 +812,50 @@ def fetch_image_pair(
         tile_dir = data_dir / "tiles"
         tile_dir.mkdir(parents=True, exist_ok=True)
 
-        for tile in _build_tiles(grid):
+        tiles_to_fetch = list(_build_tiles(grid))
+        n_tiles = len(tiles_to_fetch)
+        n_images = 4  # before/after × optical/SAR
+        total_jobs = n_tiles * n_images
+        completed_jobs: list[int] = [0]  # mutable counter shared via closure
+        _tile_lock: "threading.Lock"
+
+        import threading as _tile_threading
+        _tile_lock = _tile_threading.Lock()
+
+        def _download_tile_image(tile, prefix, image, key):
             xmin, ymin, xmax, ymax = tile["bounds_utm"]
             tile_grid = _grid_metadata(xmin, ymin, xmax, ymax, grid["epsg"])
-            for prefix, image, key in (
-                ("before_optical", optical1_raw, "before_optical"),
-                ("after_optical", optical2_raw, "after_optical"),
-                ("before_sar", sar1_raw, "before_sar"),
-                ("after_sar", sar2_raw, "after_sar"),
-            ):
-                path = tile_dir / f"{prefix}_r{tile['row']:04d}_c{tile['col']:04d}.tif"
-                _write_ee_geotiff(image, path, tile_grid)
-                tile_files[key].append(str(path))
+            path = tile_dir / f"{prefix}_r{tile['row']:04d}_c{tile['col']:04d}.tif"
+            _write_ee_geotiff(image, path, tile_grid)
+            with _tile_lock:
+                completed_jobs[0] += 1
+                done = completed_jobs[0]
+                if update_progress:
+                    tile_num = (tile["row"] * max(1, int(grid.get("n_cols", 1))) + tile["col"] + 1)
+                    update_progress(
+                        f"Downloading tile {tile_num}/{n_tiles} "
+                        f"({prefix}) [{done}/{total_jobs} downloads done]"
+                    )
+            return key, str(path)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        futures = []
+        MAX_CONCURRENT_TILE_DOWNLOADS = 2
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TILE_DOWNLOADS,
+                                thread_name_prefix="geowatch-tile") as pool:
+            for tile in tiles_to_fetch:
+                for prefix, image, key in (
+                    ("before_optical", optical1_raw, "before_optical"),
+                    ("after_optical",  optical2_raw, "after_optical"),
+                    ("before_sar",     sar1_raw,     "before_sar"),
+                    ("after_sar",      sar2_raw,     "after_sar"),
+                ):
+                    futures.append(pool.submit(_download_tile_image, tile, prefix, image, key))
+
+            for future in as_completed(futures):
+                key, path = future.result()  # re-raise any exception from worker
+                tile_files[key].append(path)
+
 
     preview_size = min(1024, max(grid["width_px"], grid["height_px"]))
     if update_progress:
