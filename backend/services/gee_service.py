@@ -35,8 +35,12 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import math
 import os
+import random
+import threading
+import time
 import uuid
 import zipfile
 from datetime import date
@@ -50,6 +54,9 @@ from shapely.geometry import Polygon
 from shapely.ops import transform as shapely_transform
 
 from services.model_registry import get_model_config, validate_model_contract
+
+logger = logging.getLogger(__name__)
+_GEE_TRACE = os.getenv("GEOWATCH_GEE_TRACE", "false").strip().lower() == "true"
 
 
 PATCH_PX = 128
@@ -79,17 +86,40 @@ ProgressCallback = Callable[[str], None]
 
 
 # ---------------------------------------------------------------------------
-# Earth Engine initialization
+# Earth Engine transport-resilience constants
 # ---------------------------------------------------------------------------
 
+# Transient HTTP status codes that warrant a retry.
+TRANSIENT_EE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+# Keywords in EEException messages that indicate a transient server failure.
+_TRANSIENT_EE_KEYWORDS = (
+    "429", "500", "502", "503", "504",
+    "rate limit", "too many requests",
+    "service unavailable", "backend error",
+    "connection reset", "connection aborted",
+    "timeout", "deadline",
+)
+
+# Maximum number of application-level getInfo() retries.
+_EE_TRANSPORT_RETRIES = 6
+# Max sleep cap per retry (seconds)
+_EE_MAX_BACKOFF_S = 60.0
+# Jitter band (seconds)
+_EE_JITTER_S = 1.5
+
+# Lock protecting one-time EE (re)initialization
+_EE_INIT_LOCK = threading.Lock()
+# Set to True once successfully initialized
 _EE_INITIALISED = False
 
 
-def _init_ee() -> None:
-    global _EE_INITIALISED
-    if _EE_INITIALISED:
-        return
+# ---------------------------------------------------------------------------
+# Earth Engine initialization
+# ---------------------------------------------------------------------------
 
+def _do_ee_initialize() -> None:
+    """Perform the actual ee.Initialize() call (no lock, no guard)."""
     project_id = os.getenv("GEE_PROJECT_ID", "satellite-based")
     sa_key = os.getenv("GEE_SERVICE_ACCOUNT_KEY")
     sa_email = os.getenv("GEE_SERVICE_ACCOUNT_EMAIL")
@@ -101,7 +131,6 @@ def _init_ee() -> None:
             credentials = ee.ServiceAccountCredentials(sa_email, sa_key)
             ee.Initialize(credentials=credentials, project=project_id)
         else:
-            # Uses the locally configured Earth Engine / ADC credentials.
             ee.Initialize(project=project_id)
     except Exception as exc:
         raise RuntimeError(
@@ -109,7 +138,156 @@ def _init_ee() -> None:
             "Please check your Google Cloud IAM permissions and GEE_PROJECT_ID."
         ) from exc
 
-    _EE_INITIALISED = True
+    # Configure client-side retry / deadline settings after initialization.
+    max_retries = int(os.getenv("GEOWATCH_EE_MAX_RETRIES", "8"))
+    deadline_ms  = int(os.getenv("GEOWATCH_EE_DEADLINE_MS",  "300000"))
+
+    if max_retries < 0 or max_retries > 30:
+        raise ValueError(
+            f"GEOWATCH_EE_MAX_RETRIES={max_retries} is out of bounds (0-30)"
+        )
+    if deadline_ms <= 0:
+        raise ValueError(
+            f"GEOWATCH_EE_DEADLINE_MS={deadline_ms} must be positive"
+        )
+
+    try:
+        ee.data.setMaxRetries(max_retries)
+        ee.data.setDeadline(deadline_ms)
+    except Exception as cfg_err:
+        # Non-fatal: settings may not be available in older ee versions.
+        logger.warning("Could not apply EE client settings: %s", cfg_err)
+
+    logger.info(
+        "Earth Engine initialized: project=%s max_retries=%d deadline_ms=%d",
+        project_id, max_retries, deadline_ms,
+    )
+
+
+def _init_ee() -> None:
+    """Idempotent EE initialization with lock protection."""
+    global _EE_INITIALISED
+    if _EE_INITIALISED:
+        return
+    with _EE_INIT_LOCK:
+        if _EE_INITIALISED:  # double-check inside lock
+            return
+        _do_ee_initialize()
+        _EE_INITIALISED = True
+
+
+def _reinit_ee() -> None:
+    """Single safe re-initialization attempt after transport failure."""
+    global _EE_INITIALISED
+    with _EE_INIT_LOCK:
+        logger.warning("Attempting Earth Engine re-initialization after transport failure…")
+        _EE_INITIALISED = False
+        try:
+            _do_ee_initialize()
+            _EE_INITIALISED = True
+            logger.info("Earth Engine re-initialization succeeded.")
+        except Exception as exc:
+            logger.error("Earth Engine re-initialization failed: %s", exc)
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Transport-resilient getInfo() wrapper
+# ---------------------------------------------------------------------------
+
+def _is_transient_ee_exception(exc: Exception) -> bool:
+    """Return True if an EEException looks like a transient server failure."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _TRANSIENT_EE_KEYWORDS)
+
+
+def _ee_get_info_with_retry(
+    obj: Any,
+    operation_name: str,
+    *,
+    attempts: int = _EE_TRANSPORT_RETRIES,
+    update_progress: Any = None,
+) -> Any:
+    """
+    Call obj.getInfo() (or obj if obj is already a plain Python dict/list)
+    with exponential-backoff retry for transient network / server failures.
+
+    Deterministic EEExceptions (400, 401, 403, 404, bad expression, geometry
+    errors) are NOT retried and propagate immediately.
+
+    After all attempts fail with transport errors, attempt one EE
+    re-initialization (guarded by _EE_INIT_LOCK) and a final retry.
+    """
+    last_exc: Exception | None = None
+    t0 = time.monotonic() if _GEE_TRACE else None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            result = obj.getInfo()
+            if _GEE_TRACE:
+                elapsed = time.monotonic() - t0
+                logger.debug(
+                    "[GEE trace] operation=%s attempt=%d/%d elapsed=%.2fs result_type=%s",
+                    operation_name, attempt, attempts, elapsed, type(result).__name__,
+                )
+            return result
+
+        except ee.EEException as eee:
+            # Only retry EEExceptions that look transient.
+            if not _is_transient_ee_exception(eee):
+                logger.error(
+                    "[GEE] Deterministic EEException for '%s': %s — not retrying.",
+                    operation_name, eee,
+                )
+                raise
+            last_exc = eee
+            exc_label = f"EEException({eee})"
+
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as transport_exc:
+            last_exc = transport_exc
+            exc_label = f"{type(transport_exc).__name__}: {str(transport_exc)[:120]}"
+
+        # --- transient failure: back off and retry ---
+        if attempt >= attempts:
+            break
+
+        sleep_s = min(_EE_MAX_BACKOFF_S, (2 ** (attempt - 1)) + random.uniform(0, _EE_JITTER_S))
+        logger.warning(
+            "[GEE retry] operation=%s attempt=%d/%d exception=%s sleep=%.1fs",
+            operation_name, attempt, attempts, exc_label, sleep_s,
+        )
+        if update_progress:
+            update_progress(f"Earth Engine connection retry {attempt}/{attempts - 1}...")
+        time.sleep(sleep_s)
+
+    # All normal retries exhausted — attempt one EE re-init
+    is_transport = isinstance(last_exc, (
+        requests.exceptions.SSLError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+    )) or (isinstance(last_exc, ee.EEException) and _is_transient_ee_exception(last_exc))
+
+    if is_transport:
+        try:
+            logger.warning(
+                "[GEE] All %d transport retries for '%s' exhausted; attempting EE re-init…",
+                attempts, operation_name,
+            )
+            _reinit_ee()
+            result = obj.getInfo()
+            logger.info("[GEE] Operation '%s' succeeded after EE re-init.", operation_name)
+            return result
+        except Exception as reinit_exc:
+            last_exc = reinit_exc
+
+    raise RuntimeError(
+        f"Earth Engine operation '{operation_name}' failed after {attempts} attempts "
+        f"(category=gee_transport, host=earthengine.googleapis.com): "
+        f"{type(last_exc).__name__}: {last_exc}"
+    ) from last_exc
+
 
 
 # ---------------------------------------------------------------------------
@@ -420,10 +598,29 @@ def _optical_composite(d0: str, d1: str, aoi: ee.Geometry) -> ee.Image:
     return masked.median().addBands(n_clear).clip(aoi)
 
 
-def _s2_quality_summary(d0: str, d1: str, aoi: ee.Geometry) -> dict[str, float | int]:
-    """Compute scene count and clear-observation statistics with minimal sync calls."""
+def _s2_quality_summary(
+    d0: str,
+    d1: str,
+    aoi: ee.Geometry,
+    label: str = "T?",
+    update_progress: Any = None,
+) -> dict[str, float | int]:
+    """
+    Compute scene count and clear-observation statistics.
+
+    Consolidates into TWO EE RPCs:
+      1. scene count
+      2. combined quality dict (coverage fraction + mean/min/max n_clear)
+    """
     collection = _s2_collection(d0, d1, aoi)
-    scene_count = int(collection.size().getInfo())
+
+    if update_progress:
+        update_progress(f"Checking Sentinel-2 {label} scene coverage...")
+    scene_count = int(_ee_get_info_with_retry(
+        collection.size(),
+        f"S2 {label} scene count",
+        update_progress=update_progress,
+    ))
     if scene_count <= 0:
         raise ValueError(f"No Sentinel-2 scenes found for {d0} to {d1}")
 
@@ -435,31 +632,43 @@ def _s2_quality_summary(d0: str, d1: str, aoi: ee.Geometry) -> dict[str, float |
     )
     n_clear = masked.count().rename("n_clear").unmask(0)
 
-    valid_fraction = n_clear.gt(0).reduceRegion(
-        reducer=ee.Reducer.mean(),
+    # Build a single server-side dict so all quality metrics arrive in one RPC.
+    reduce_kwargs = dict(
         geometry=aoi,
         scale=RESOLUTION,
         maxPixels=100_000_000,
         bestEffort=True,
-    ).get("n_clear")
-
-    stats = n_clear.reduceRegion(
+    )
+    coverage_fraction_dict = n_clear.gt(0).reduceRegion(
+        reducer=ee.Reducer.mean(), **reduce_kwargs
+    )
+    stats_dict = n_clear.reduceRegion(
         reducer=ee.Reducer.mean().combine(
-            reducer2=ee.Reducer.minMax(),
-            sharedInputs=True,
+            reducer2=ee.Reducer.minMax(), sharedInputs=True
         ),
-        geometry=aoi,
-        scale=RESOLUTION,
-        maxPixels=100_000_000,
-        bestEffort=True,
-    ).getInfo() or {}
+        **reduce_kwargs,
+    )
+    combined = ee.Dictionary({
+        "clear_coverage_fraction": coverage_fraction_dict.get("n_clear", 0),
+        "n_clear_mean": stats_dict.get("n_clear_mean", 0),
+        "n_clear_min":  stats_dict.get("n_clear_min",  0),
+        "n_clear_max":  stats_dict.get("n_clear_max",  0),
+    })
+
+    if update_progress:
+        update_progress(f"Checking Sentinel-2 {label} clear coverage quality...")
+    raw = _ee_get_info_with_retry(
+        combined,
+        f"S2 {label} quality summary",
+        update_progress=update_progress,
+    ) or {}
 
     result = {
-        "scene_count": scene_count,
-        "clear_coverage_fraction": float(valid_fraction.getInfo() or 0.0),
-        "n_clear_mean": float(stats.get("n_clear_mean", 0.0)),
-        "n_clear_min": int(stats.get("n_clear_min", 0)),
-        "n_clear_max": int(stats.get("n_clear_max", 0)),
+        "scene_count":  scene_count,
+        "clear_coverage_fraction": float(raw.get("clear_coverage_fraction") or 0.0),
+        "n_clear_mean": float(raw.get("n_clear_mean") or 0.0),
+        "n_clear_min":  int(raw.get("n_clear_min")  or 0),
+        "n_clear_max":  int(raw.get("n_clear_max")  or 0),
     }
 
     if result["clear_coverage_fraction"] <= 0.0:
@@ -468,6 +677,7 @@ def _s2_quality_summary(d0: str, d1: str, aoi: ee.Geometry) -> dict[str, float |
             f"observation at cs_cdf >= {CLEAR_THR:.2f}."
         )
     return result
+
 
 
 # ---------------------------------------------------------------------------
@@ -505,14 +715,47 @@ def _get_common_relative_orbit(
     t2_end: str,
     aoi: ee.Geometry,
     preferred_orbit: int | None = None,
+    update_progress: Any = None,
 ) -> tuple[int, int, int]:
+    """
+    Select a common descending Sentinel-1 relative orbit for T1 and T2.
+
+    Uses TWO EE RPCs (one histogram per temporal window) instead of N per-orbit
+    count calls, dramatically reducing value:compute round-trips.
+
+    Exact orbit-selection rule is preserved:
+      1. preferred_orbit if it is common
+      2. maximize min(n1, n2)
+      3. tie-break: n1+n2 (total coverage)
+      4. tie-break: smallest orbit number
+    """
     t1 = _s1_base(t1_start, t1_end, aoi)
     t2 = _s1_base(t2_start, t2_end, aoi)
 
-    t1_orbits = set(int(x) for x in (t1.aggregate_array("relativeOrbitNumber_start").distinct().getInfo() or []))
-    t2_orbits = set(int(x) for x in (t2.aggregate_array("relativeOrbitNumber_start").distinct().getInfo() or []))
-    common = sorted(t1_orbits & t2_orbits)
+    if update_progress:
+        update_progress("Checking Sentinel-1 common relative orbit (T1 histogram)...")
+    t1_hist: dict = _ee_get_info_with_retry(
+        t1.aggregate_histogram("relativeOrbitNumber_start"),
+        "S1 T1 relative-orbit histogram",
+        update_progress=update_progress,
+    ) or {}
 
+    if update_progress:
+        update_progress("Checking Sentinel-1 common relative orbit (T2 histogram)...")
+    t2_hist: dict = _ee_get_info_with_retry(
+        t2.aggregate_histogram("relativeOrbitNumber_start"),
+        "S1 T2 relative-orbit histogram",
+        update_progress=update_progress,
+    ) or {}
+
+    # EE histogram keys may be strings even for numeric properties.
+    def _hist_int_key(h: dict) -> dict[int, int]:
+        return {int(k): int(v) for k, v in h.items()}
+
+    t1_counts = _hist_int_key(t1_hist)
+    t2_counts = _hist_int_key(t2_hist)
+
+    common = sorted(set(t1_counts) & set(t2_counts))
     if not common:
         raise ValueError(
             "No common descending Sentinel-1 relative orbit exists in both temporal windows."
@@ -520,36 +763,66 @@ def _get_common_relative_orbit(
 
     if preferred_orbit is not None and preferred_orbit in common:
         selected = preferred_orbit
+        n1 = t1_counts[selected]
+        n2 = t2_counts[selected]
     else:
-        # Choose the common orbit maximizing the weaker period's scene count.
-        scores: list[tuple[int, int, int]] = []
+        # Score: (min(n1,n2), n1+n2, -orbit) — pick max; negate orbit for tie-break
+        scores: list[tuple[int, int, int, int]] = []
         for orbit in common:
-            n1 = int(t1.filter(ee.Filter.eq("relativeOrbitNumber_start", orbit)).size().getInfo())
-            n2 = int(t2.filter(ee.Filter.eq("relativeOrbitNumber_start", orbit)).size().getInfo())
-            scores.append((min(n1, n2), n1 + n2, orbit))
-        selected = max(scores)[2]
+            n1 = t1_counts[orbit]
+            n2 = t2_counts[orbit]
+            scores.append((min(n1, n2), n1 + n2, -orbit, orbit))
+        best = max(scores)
+        selected = best[3]
+        n1 = t1_counts[selected]
+        n2 = t2_counts[selected]
 
-    n1 = int(t1.filter(ee.Filter.eq("relativeOrbitNumber_start", selected)).size().getInfo())
-    n2 = int(t2.filter(ee.Filter.eq("relativeOrbitNumber_start", selected)).size().getInfo())
     if n1 <= 0 or n2 <= 0:
         raise ValueError("Selected Sentinel-1 relative orbit has no observations in one period")
 
+    logger.info(
+        "[GEE] S1 orbit selected: orbit=%d T1_count=%d T2_count=%d common_orbits=%s",
+        selected, n1, n2, common,
+    )
     return int(selected), n1, n2
 
 
-def _sar_composite(d0: str, d1: str, aoi: ee.Geometry, relative_orbit: int) -> ee.Image:
+def _sar_composite(
+    d0: str,
+    d1: str,
+    aoi: ee.Geometry,
+    relative_orbit: int,
+    *,
+    observation_count: int | None = None,
+) -> ee.Image:
+    """
+    Build a despeckled S1 dB composite for the selected orbit.
+
+    observation_count: if provided (passed from _get_common_relative_orbit result),
+    skips the extra getInfo() call to check collection size.
+    """
     collection = (
         _s1_base(d0, d1, aoi)
         .filter(ee.Filter.eq("relativeOrbitNumber_start", relative_orbit))
         .select(S1_BANDS)
     )
-    count = collection.size()
 
-    if int(count.getInfo()) <= 0:
+    # Use the already-known observation count if available to avoid an extra RPC.
+    if observation_count is not None:
+        count_val = int(observation_count)
+    else:
+        count_val = int(_ee_get_info_with_retry(
+            collection.size(),
+            f"S1 composite observation count (orbit={relative_orbit} {d0}–{d1})",
+        ))
+
+    if count_val <= 0:
         raise ValueError(
             f"No Sentinel-1 VV/VH observations for orbit {relative_orbit} "
             f"during {d0} to {d1}"
         )
+
+    count = collection.size()  # keep as EE object for server-side Algorithms.If
 
     def to_natural(img):
         return ee.Image(10).pow(img.divide(10.0))
@@ -569,6 +842,7 @@ def _sar_composite(d0: str, d1: str, aoi: ee.Geometry, relative_orbit: int) -> e
     )
 
 
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -577,10 +851,71 @@ def _estimate_bytes(width_px: int, height_px: int, bands: int, bytes_per_sample:
     return width_px * height_px * bands * bytes_per_sample
 
 
+def _download_bytes_with_retry(
+    url: str,
+    timeout: int = 120,
+    operation_name: str = "GEE download",
+) -> bytes:
+    """
+    Download raw bytes with exponential-backoff retry for transient network
+    and HTTP 429/5xx failures. SSL verification is always enabled.
+
+    Uses a fresh per-request session to avoid shared mutable state between
+    concurrent download threads.
+    """
+    _RETRIES = 4
+    _MAX_SLEEP = 30.0
+    last_exc: Exception | None = None
+
+    for attempt in range(1, _RETRIES + 1):
+        try:
+            # Per-request session: no shared state between concurrent workers.
+            with requests.Session() as session:
+                resp = session.get(
+                    url,
+                    timeout=(30, timeout),  # (connect_timeout, read_timeout)
+                    verify=True,             # SSL verification always on
+                )
+            if resp.status_code in TRANSIENT_EE_HTTP_STATUSES:
+                raise requests.exceptions.HTTPError(
+                    f"HTTP {resp.status_code}", response=resp
+                )
+            resp.raise_for_status()
+            return resp.content
+
+        except (requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as transport_exc:
+            last_exc = transport_exc
+            exc_label = f"{type(transport_exc).__name__}: {str(transport_exc)[:100]}"
+
+        except requests.exceptions.HTTPError as http_exc:
+            status = http_exc.response.status_code if http_exc.response is not None else 0
+            if status not in TRANSIENT_EE_HTTP_STATUSES:
+                raise  # deterministic 4xx (not 429) — do not retry
+            last_exc = http_exc
+            exc_label = f"HTTP {status}"
+
+        if attempt >= _RETRIES:
+            break
+
+        sleep_s = min(_MAX_SLEEP, (2 ** (attempt - 1)) + random.uniform(0, 1.5))
+        logger.warning(
+            "[GEE download retry] operation=%s attempt=%d/%d exception=%s sleep=%.1fs",
+            operation_name, attempt, _RETRIES, exc_label, sleep_s,
+        )
+        time.sleep(sleep_s)
+
+    raise RuntimeError(
+        f"Download failed for '{operation_name}' after {_RETRIES} attempts: "
+        f"{type(last_exc).__name__}: {last_exc}"
+    ) from last_exc
+
+
+# Keep backwards-compat alias.
 def _download_bytes(url: str, timeout: int = 120) -> bytes:
-    response = requests.get(url, timeout=timeout)
-    response.raise_for_status()
-    return response.content
+    return _download_bytes_with_retry(url, timeout=timeout, operation_name="GEE download")
+
 
 
 def _write_ee_geotiff(
@@ -743,10 +1078,14 @@ def fetch_image_pair(
     center_lon = grid.get("centroid_lon")
     preferred_orbit = _preferred_orbit_for_point(center_lat, center_lon, model_id)
 
-    if update_progress:
-        update_progress("Checking Sentinel-2 coverage and clear-pixel quality...")
-    s2_quality_t1 = _s2_quality_summary(t1_start, t1_end, original_aoi_geom)
-    s2_quality_t2 = _s2_quality_summary(t2_start, t2_end, original_aoi_geom)
+    s2_quality_t1 = _s2_quality_summary(
+        t1_start, t1_end, original_aoi_geom,
+        label="T1", update_progress=update_progress,
+    )
+    s2_quality_t2 = _s2_quality_summary(
+        t2_start, t2_end, original_aoi_geom,
+        label="T2", update_progress=update_progress,
+    )
 
     if update_progress:
         update_progress("Selecting a common descending Sentinel-1 relative orbit...")
@@ -757,17 +1096,31 @@ def fetch_image_pair(
         t2_end,
         acquisition_geom,
         preferred_orbit=preferred_orbit,
+        update_progress=update_progress,
     )
 
     if update_progress:
-        update_progress("Building T1 Sentinel-2/Sentinel-1 composites...")
+        update_progress("Building T1 Sentinel-2 composite...")
     opt1 = _optical_composite(t1_start, t1_end, acquisition_geom)
-    sar1 = _sar_composite(t1_start, t1_end, acquisition_geom, common_orbit)
 
     if update_progress:
-        update_progress("Building T2 Sentinel-2/Sentinel-1 composites...")
+        update_progress("Building T1 Sentinel-1 composite...")
+    sar1 = _sar_composite(
+        t1_start, t1_end, acquisition_geom, common_orbit,
+        observation_count=s1_count_t1,
+    )
+
+    if update_progress:
+        update_progress("Building T2 Sentinel-2 composite...")
     opt2 = _optical_composite(t2_start, t2_end, acquisition_geom)
-    sar2 = _sar_composite(t2_start, t2_end, acquisition_geom, common_orbit)
+
+    if update_progress:
+        update_progress("Building T2 Sentinel-1 composite...")
+    sar2 = _sar_composite(
+        t2_start, t2_end, acquisition_geom, common_orbit,
+        observation_count=s1_count_t2,
+    )
+
 
     # Each API image pair has a stable directory so the image controller can
     # serve the generated PNGs using the same pair_id.
